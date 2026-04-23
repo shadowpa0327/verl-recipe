@@ -4,22 +4,28 @@ Test Mooncake store: put / get / remove cycle with sample tensors.
 
 Prerequisites:
   1. Install mooncake: pip install mooncake
-  2. Start mooncake master (one of):
-     a. mooncake_master --port=50051 --http_metadata_server_port=8090 --enable_http_metadata_server=true
-     b. python -c "from recipe.drafter_cotraining.mooncake.master import resolve_mooncake_master_bin; print(resolve_mooncake_master_bin())"
+
+The script launches its own mooncake_master subprocess by default
+(``--launch-master``, on by default). Use ``--no-launch-master`` to point at
+an already-running master.
 
 Usage:
-  # With a running mooncake master on localhost:
+  # All-in-one (launches its own master subprocess on localhost):
   python scripts/test_mooncake_store.py
 
-  # With a remote master:
-  python scripts/test_mooncake_store.py --master-host 10.0.0.1
+  # With an externally-running master:
+  python scripts/test_mooncake_store.py --no-launch-master --master-host 10.0.0.1
 
   # Dry run (test imports + config only, no mooncake server needed):
   python scripts/test_mooncake_store.py --dry-run
 """
 
 import argparse
+import atexit
+import os
+import signal
+import socket
+import subprocess
 import sys
 import time
 
@@ -34,7 +40,87 @@ def parse_args():
     parser.add_argument("--seq-len", type=int, default=128, help="Test sequence length")
     parser.add_argument("--hidden-dim", type=int, default=4096, help="Hidden dimension")
     parser.add_argument("--dry-run", action="store_true", help="Test imports only, no server needed")
+    parser.add_argument(
+        "--launch-master",
+        dest="launch_master",
+        action="store_true",
+        default=True,
+        help="Launch a local mooncake_master subprocess (default: on)",
+    )
+    parser.add_argument(
+        "--no-launch-master",
+        dest="launch_master",
+        action="store_false",
+        help="Use an externally-running mooncake_master",
+    )
     return parser.parse_args()
+
+
+def _wait_for_port(host: str, port: int, timeout: float = 10.0) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(0.5)
+            try:
+                s.connect((host, port))
+                return True
+            except OSError:
+                time.sleep(0.1)
+    return False
+
+
+def launch_local_master(args) -> "subprocess.Popen | None":
+    """Spawn a mooncake_master subprocess on the configured ports.
+
+    Lighter-weight than recipe.drafter_cotraining.mooncake.master.launch_mooncake_master
+    (no Ray actor needed for a simple sanity test). Returns None if the
+    binary is missing.
+    """
+    from recipe.drafter_cotraining.mooncake.master import resolve_mooncake_master_bin
+
+    bin_path = resolve_mooncake_master_bin()
+    if not os.path.exists(bin_path):
+        print(f"  mooncake_master binary not found at {bin_path}; skipping launch")
+        return None
+
+    cmd = [
+        bin_path,
+        f"--port={args.master_port}",
+        f"--http_metadata_server_port={args.metadata_port}",
+        "--enable_http_metadata_server=true",
+    ]
+    print(f"  Launching mooncake_master: {' '.join(cmd)}")
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        preexec_fn=os.setsid,  # so we can kill the whole process group
+    )
+
+    def _cleanup():
+        if proc.poll() is None:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                proc.wait(timeout=5)
+            except Exception:
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                except Exception:
+                    pass
+
+    atexit.register(_cleanup)
+
+    if not _wait_for_port(args.master_host, args.master_port, timeout=10.0):
+        print(f"  mooncake_master did not become reachable on {args.master_host}:{args.master_port}")
+        _cleanup()
+        sys.exit(1)
+    if not _wait_for_port(args.master_host, args.metadata_port, timeout=10.0):
+        print(f"  metadata server did not become reachable on {args.master_host}:{args.metadata_port}")
+        _cleanup()
+        sys.exit(1)
+    print(f"  mooncake_master ready on {args.master_host}:{args.master_port} "
+          f"(metadata :{args.metadata_port}), PID={proc.pid}\n")
+    return proc
 
 
 def test_imports():
@@ -51,9 +137,6 @@ def test_imports():
 
     from recipe.drafter_cotraining.mooncake.buffers import HostBuffer, HostBufferPool, AsyncPutManager
     print(f"  HostBuffer, HostBufferPool, AsyncPutManager: OK")
-
-    from recipe.drafter_cotraining.mooncake.deferred_delete import DeferredDeleteManager
-    print(f"  DeferredDeleteManager: OK")
 
     from recipe.drafter_cotraining.mooncake.store import MooncakeHiddenStateStore
     print(f"  MooncakeHiddenStateStore: OK")
@@ -203,7 +286,7 @@ def test_put_get_remove(args, config, EagleMooncakeStore, Eagle3TargetOutput):
         has_last_hidden_states=True,
         has_target=False,
     )
-    print(f"  Removal queued (deferred delete after TTL).")
+    print(f"  Removal force-deleted (batch_remove force=True).")
     print()
 
     # Cleanup
@@ -226,6 +309,14 @@ def main():
         print("Run without --dry-run with a Mooncake master to test put/get/remove.")
         print("=" * 60)
         return
+
+    if args.launch_master:
+        print("=" * 60)
+        print("Step 4a: Launching local mooncake_master subprocess")
+        print("=" * 60)
+        if launch_local_master(args) is None:
+            print("Master not launched; pass --no-launch-master and start one yourself.")
+            sys.exit(1)
 
     success = test_put_get_remove(args, config, EagleMooncakeStore, Eagle3TargetOutput)
 
