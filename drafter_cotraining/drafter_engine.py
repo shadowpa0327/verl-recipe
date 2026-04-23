@@ -38,15 +38,128 @@ Usage:
 
 import copy
 import logging
-from typing import Optional
+from dataclasses import dataclass, field
+from typing import Any, Optional
 
 import torch
 from tensordict import TensorDict
 
+from verl.base_config import BaseConfig
 from verl.workers.engine.base import EngineRegistry
 from verl.workers.engine.fsdp.transformer_impl import FSDPEngine
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class DrafterModelConfig(BaseConfig):
+    """Minimal model config for the drafter engine.
+
+    The parent ``HFModelConfig`` is too heavy for us — it eagerly loads
+    tokenizers, HF AutoConfig and hf_processor from a target-model path.
+    The drafter is a standalone Eagle3 draft model loaded from a plain JSON
+    file via ``AutoDraftModelConfig.from_file``, so we only need enough
+    fields to satisfy ``FSDPEngine.__init__`` and ``_build_fsdp_module``.
+    """
+
+    _mutable_fields = {"local_path"}
+
+    # Path to the draft-model JSON config (consumed by AutoDraftModelConfig.from_file).
+    local_path: Optional[str] = None
+    dtype: str = "bfloat16"
+    ttt_length: int = 7
+
+    # Path to the target (verifier) model — a HF repo id or local dir. We load
+    # three frozen weights from here at drafter init:
+    #   embed_tokens.weight      → draft_model.embed_tokens  (FSDP2-broadcast via fsdp2_load_full_state_dict)
+    #   lm_head.weight           → self._target_lm_head_weight (dist.broadcast from rank 0)
+    #   model.norm.weight        → self._verifier_norm.weight  (dist.broadcast from rank 0)
+    # Matches TorchSpec's eagle3_trainer load pattern.
+    target_model_path: Optional[str] = None
+
+    # Fields accessed by FSDPEngine — stubbed so the parent __init__ works.
+    use_remove_padding: bool = False
+    lora_rank: int = 0
+    lora_alpha: int = 16
+    target_modules: Optional[Any] = None
+    target_parameters: Optional[list[str]] = None
+    exclude_modules: Optional[str] = None
+    lora: dict[str, Any] = field(default_factory=dict)
+    use_liger: bool = False
+    use_fused_kernels: bool = False
+    fused_kernel_options: dict = field(default_factory=dict)
+    enable_gradient_checkpointing: bool = False
+    enable_activation_offload: bool = False
+    trust_remote_code: bool = False
+
+    def get_processor(self):
+        # The drafter has no tokenizer; FSDPCheckpointManager handles None.
+        return None
+
+
+def _load_tensors_from_model_path(model_path: str, keys: list[str]) -> dict:
+    """Load a subset of weight tensors from an HF model directory or repo id.
+
+    Handles both sharded checkpoints (``*.index.json`` + multiple safetensors
+    files) and single-file checkpoints (``model.safetensors``). Falls back to
+    ``snapshot_download`` if the path doesn't exist locally.
+    """
+    import glob
+    import json
+    import os
+
+    from huggingface_hub import snapshot_download
+    from safetensors import safe_open
+
+    if not os.path.exists(model_path):
+        model_path = snapshot_download(repo_id=model_path)
+
+    out: dict = {}
+
+    index_files = glob.glob(os.path.join(model_path, "*.index.json"))
+    if index_files:
+        with open(index_files[0]) as f:
+            index = json.load(f)
+        weight_map = index["weight_map"]
+        files_to_keys: dict[str, list[str]] = {}
+        for key in keys:
+            files_to_keys.setdefault(weight_map[key], []).append(key)
+        for fname, fkeys in files_to_keys.items():
+            with safe_open(os.path.join(model_path, fname), framework="pt") as f:
+                for key in fkeys:
+                    out[key] = f.get_tensor(key)
+        return out
+
+    single_file = os.path.join(model_path, "model.safetensors")
+    if os.path.exists(single_file):
+        with safe_open(single_file, framework="pt") as f:
+            for key in keys:
+                out[key] = f.get_tensor(key)
+        return out
+
+    raise FileNotFoundError(
+        f"No *.index.json or model.safetensors found under {model_path}"
+    )
+
+
+def build_drafter_subconfig(cfg, cls):
+    """Build a drafter sub-config dataclass from a (possibly OmegaConf) dict.
+
+    Bypasses ``omega_conf_to_dataclass`` (i.e. ``OmegaConf.structured(cls)``)
+    which rejects some verl dataclasses whose type annotations don't match
+    their ``None`` defaults — e.g. ``EngineConfig.max_token_len_per_gpu: int = None``
+    raises ``ValidationError: Incompatible value 'None' for field of type 'int'``.
+    """
+    from dataclasses import fields
+
+    from omegaconf import DictConfig, OmegaConf
+
+    if isinstance(cfg, DictConfig):
+        cfg = OmegaConf.to_container(cfg, resolve=True)
+    cfg = cfg or {}
+    allowed = {f.name for f in fields(cls)}
+    kwargs = {k: v for k, v in cfg.items() if k in allowed}
+    return cls(**kwargs)
 
 
 @EngineRegistry.register(model_type="drafter_model", backend=["fsdp", "fsdp2"], device=["cuda", "npu"])
@@ -57,51 +170,137 @@ class FSDPDrafterEngine(FSDPEngine):
     Tiny model (~2% of target params): fc projection + 1 decoder layer.
     Frozen modules (embed_tokens) copied from actor, re-synced after
     each update_actor(). lm_head is trainable (draft model's own).
+
+    ``_build_module`` is overridden so the parent's standard
+    ``_build_model_optimizer`` flow (build → FSDP-wrap → optimizer → LR
+    scheduler → checkpoint manager) runs end-to-end; the drafter doesn't
+    want the HF AutoModel path that ``FSDPEngine._build_module`` uses.
     """
 
     def __init__(self, model_config, engine_config, optimizer_config, checkpoint_config):
         super().__init__(model_config, engine_config, optimizer_config, checkpoint_config)
-        # Frozen modules from actor — set by sync_frozen_modules_from_actor()
+        # Frozen target-side weights — set by _load_target_frozen_weights()
         self._verifier_norm = None           # RMSNorm for pre-norm last_hs from vLLM
         self._target_lm_head_weight = None   # target lm_head weight for LazyTarget
 
-    def initialize(self):
-        """Load the EAGLE draft model, wrap in Eagle3Model, and set up FSDP.
+    def _build_module(self):
+        """Return the Eagle3-wrapped draft model (parent expects a plain nn.Module).
 
-        Creates:
-            self.module = Eagle3Model(draft_model, length=7)
-        Then parent's initialize() applies FSDP to self.module.
+        On rank 0 we load the target model's ``embed_tokens.weight`` into the
+        draft's ``embed_tokens`` before FSDP wraps. The parent's fsdp2 path
+        captures ``full_state = module.state_dict()`` pre-wrap then calls
+        ``fsdp2_load_full_state_dict(..., broadcast_from_rank0=True)`` so all
+        ranks end up with the same weights post-wrap.
         """
-        from recipe.drafter_cotraining.eagle3.draft.auto import AutoEagle3DraftModel, AutoDraftModelConfig
+        import torch.distributed as dist
+
+        from recipe.drafter_cotraining.eagle3.draft.auto import AutoDraftModelConfig, AutoEagle3DraftModel
         from recipe.drafter_cotraining.eagle3.eagle3_model import Eagle3Model
 
-        # 1. Load raw draft model (fc + midlayer + embed_tokens + lm_head + norm)
+        assert self.model_config.local_path, (
+            "drafter.model_config.local_path must point to a draft-model JSON config"
+        )
+
         draft_config = AutoDraftModelConfig.from_file(self.model_config.local_path)
         draft_model = AutoEagle3DraftModel.from_config(
             draft_config,
             torch_dtype=getattr(torch, self.model_config.dtype, torch.bfloat16),
         )
 
-        # Freeze embedding (will be synced from actor)
+        # Every rank loads embed_tokens from the target checkpoint. FSDP1 doesn't
+        # do a rank-0-only load + broadcast like FSDP2's fsdp2_load_full_state_dict,
+        # so the weights must be identical on each rank pre-wrap.
+        target_path = getattr(self.model_config, "target_model_path", None)
+        if target_path:
+            draft_model.load_embedding(target_path, embedding_key="model.embed_tokens.weight")
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            logger.info("[rank %d] Loaded draft.embed_tokens from %s", rank, target_path)
+
         if hasattr(draft_model, "freeze_embedding"):
             draft_model.freeze_embedding()
 
-        # 2. Wrap in Eagle3Model — adds 7-step TTT loop
-        ttt_length = getattr(self.model_config, "ttt_length", 7)
-        self.module = Eagle3Model(draft_model, length=ttt_length)
+        ttt_length = int(getattr(self.model_config, "ttt_length", 7))
+        module = Eagle3Model(draft_model, length=ttt_length)
 
-        trainable = sum(p.numel() for p in self.module.parameters() if p.requires_grad)
-        frozen = sum(p.numel() for p in self.module.parameters() if not p.requires_grad)
+        # apply_fsdp2 reads model._no_split_modules to pick the wrap targets.
+        # Eagle3Model has exactly one LlamaDecoderLayer (as draft_model.midlayer);
+        # sharding it across DP ranks handles the bulk of the params.
+        module._no_split_modules = ["LlamaDecoderLayer"]
+        # _select_fsdp2_wrap_targets reads model.config.tie_word_embeddings;
+        # surface the draft config so FSDP2 setup doesn't blow up.
+        module.config = draft_model.config
+
+        trainable = sum(p.numel() for p in module.parameters() if p.requires_grad)
+        frozen = sum(p.numel() for p in module.parameters() if not p.requires_grad)
         logger.info(
             "Eagle3Model loaded: %s trainable, %s frozen (%.1fM total)",
             f"{trainable:,}", f"{frozen:,}", (trainable + frozen) / 1e6,
         )
+        return module
 
-        # 3. Parent applies FSDP to self.module (Eagle3Model containing draft_model)
+    def initialize(self):
+        """FSDPEngine.initialize() + target-model frozen-weight load.
+
+        After the parent sets up ``self.module`` (FSDP-wrapped Eagle3), optimizer
+        and LR scheduler, we load the target model's ``lm_head.weight`` and
+        ``model.norm.weight`` on rank 0 and broadcast them to the other ranks.
+        Both live on the engine (``_target_lm_head_weight``,``_verifier_norm``)
+        — separate from the FSDP-wrapped draft model — so a plain
+        ``dist.broadcast`` is enough.
+        """
         super().initialize()
+        target_path = getattr(self.model_config, "target_model_path", None)
+        if target_path:
+            self._load_target_frozen_weights(target_path)
+
+    def _load_target_frozen_weights(self, target_model_path: str):
+        """Load target's lm_head + model.norm into engine-owned frozen tensors.
+
+        All ranks load from disk (cheap for a small weight count). Handles
+        ``tie_word_embeddings=True`` models (e.g. Qwen3-4B) where
+        ``lm_head.weight`` isn't stored separately — it aliases
+        ``model.embed_tokens.weight``.
+        """
+        draft_model = self._get_draft_model()
+        hidden_size = int(draft_model.config.hidden_size)
+        rms_norm_eps = float(getattr(draft_model.config, "rms_norm_eps", 1e-6))
+        dtype = getattr(torch, self.model_config.dtype, torch.bfloat16)
+        device = torch.cuda.current_device()
+
+        try:
+            weights = _load_tensors_from_model_path(
+                target_model_path, ["lm_head.weight", "model.norm.weight"]
+            )
+            lm_head_src = weights["lm_head.weight"]
+        except KeyError:
+            weights = _load_tensors_from_model_path(
+                target_model_path,
+                ["model.embed_tokens.weight", "model.norm.weight"],
+            )
+            lm_head_src = weights["model.embed_tokens.weight"]
+            logger.info(
+                "lm_head.weight absent (tie_word_embeddings=True); "
+                "using model.embed_tokens.weight for target_lm_head_weight"
+            )
+        lm_head_w = lm_head_src.to(device=device, dtype=dtype)
+        norm_w = weights["model.norm.weight"].to(device=device, dtype=dtype)
+
+        lm_head_w.requires_grad = False
+        self._target_lm_head_weight = lm_head_w
+
+        from transformers.models.llama.modeling_llama import LlamaRMSNorm
+        self._verifier_norm = LlamaRMSNorm(hidden_size, eps=rms_norm_eps).to(device=device, dtype=dtype)
+        with torch.no_grad():
+            self._verifier_norm.weight.copy_(norm_w)
+        self._verifier_norm.requires_grad_(False)
+
+        logger.info(
+            "Loaded target-frozen weights from %s: lm_head=%s, verifier_norm=%s",
+            target_model_path, tuple(lm_head_w.shape), tuple(norm_w.shape),
+        )
 
     # ------------------------------------------------------------------
-    # Frozen module sync
+    # Frozen module sync (actor re-sync path — unused by the training smoke)
     # ------------------------------------------------------------------
 
     def sync_frozen_modules_from_actor(
@@ -110,47 +309,19 @@ class FSDPDrafterEngine(FSDPEngine):
         actor_lm_head: torch.nn.Module,
         actor_norm: Optional[torch.nn.Module] = None,
     ):
-        """Copy frozen weights from the actor model into the drafter.
+        """No-op in the smoke (weights are loaded from ``target_model_path``).
 
-        Must be called:
-        1. At init (after actor model is loaded)
-        2. After each update_actor() (actor weights change with RL training)
-
-        Modules synced (all frozen, requires_grad=False):
-        - embed_tokens → self.module.draft_model.embed_tokens
-        - target_lm_head_weight → self._target_lm_head_weight (separate, for target distribution)
-        - verifier_norm → self._verifier_norm (separate, for pre-norm correction)
-
-        Note: draft_model.lm_head is NOT synced — it is the draft model's
-        own trainable parameter (produces draft logits in the loss kernel).
-        actor_lm_head is only used for target_lm_head_weight.
+        Kept on the class for forward-compat with the actor-updates path where
+        the actor's weights drift every RL step and the drafter's frozen copies
+        must be re-synced. Implementing that properly requires FSDP-aware
+        gathering of the actor's (sharded) params — deferred follow-up.
         """
-        draft_model = self._get_draft_model()
-
-        # embed_tokens (used by draft_model.embed_input_ids())
-        if hasattr(draft_model, "embed_tokens"):
-            draft_model.embed_tokens.weight.data.copy_(actor_embed_tokens.weight.data)
-            draft_model.embed_tokens.weight.requires_grad = False
-
-        # target_lm_head_weight (used for target distribution in LazyTarget)
-        # This is the actor's lm_head, NOT the draft model's lm_head.
-        if self._target_lm_head_weight is None:
-            self._target_lm_head_weight = actor_lm_head.weight.data.clone()
-            self._target_lm_head_weight.requires_grad = False
-        else:
-            self._target_lm_head_weight.copy_(actor_lm_head.weight.data)
-
-        # verifier_norm (RMSNorm applied to pre-norm last_hidden_states from vLLM)
-        if actor_norm is not None:
-            if self._verifier_norm is None:
-                self._verifier_norm = copy.deepcopy(actor_norm)
-                self._verifier_norm.requires_grad_(False)
-            else:
-                for p_dst, p_src in zip(self._verifier_norm.parameters(), actor_norm.parameters()):
-                    p_dst.data.copy_(p_src.data)
-
-        logger.info("Synced frozen modules from actor (embed_tokens, target_lm_head%s)",
-                     ", verifier_norm" if actor_norm is not None else "")
+        if self._target_lm_head_weight is not None:
+            return  # target-path init already ran
+        logger.warning(
+            "sync_frozen_modules_from_actor called but target_model_path was not "
+            "set; drafter's frozen weights will remain at random init."
+        )
 
     def _get_draft_model(self):
         """Get the underlying draft model from Eagle3Model wrapper.
@@ -187,13 +358,23 @@ class FSDPDrafterEngine(FSDPEngine):
         Returns dict matching Eagle3Model.forward() signature:
             input_ids, attention_mask, target (LazyTarget), loss_mask, hidden_states
         """
-        from recipe.drafter_cotraining.eagle3.eagle3_model import compute_lazy_target_padded
+        from recipe.drafter_cotraining.eagle3.eagle3_model import compute_lazy_target_padded, padding
 
         input_ids = micro_batch["input_ids"]
         hidden_states = micro_batch["hidden_states"]
         attention_mask = micro_batch["attention_mask"]
         loss_mask = micro_batch["loss_mask"]
         last_hidden_states = micro_batch["last_hidden_states"]
+
+        # Left-shift input_ids and last_hidden_states by 1 to match Eagle3's
+        # inference semantics: at TTT step 0 position t the draft should take
+        # aux[t] + token[t+1] (the token the verifier just emitted) and predict
+        # token[t+2] = softmax(lm_head · verifier_hs[t+1]). Our Mooncake producer
+        # captures at positions 0..T-1 (input_ids[t]=token[t], last_hs[t]=HS[t]),
+        # so the training loop needs this shift — matches TorchSpec
+        # `eagle3_trainer.py::_forward` (padding(..., left=False)).
+        input_ids = padding(input_ids, left=False)
+        last_hidden_states = padding(last_hidden_states, left=False)
 
         # Apply verifier_norm to pre-norm last_hidden_states from vLLM
         if self._verifier_norm is not None:

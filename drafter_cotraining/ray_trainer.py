@@ -69,6 +69,8 @@ def _sample_metas_from_hs_batch(hs_batch: DataProto) -> list[SampleMeta]:
     if not nt or "hs_mooncake_keys" not in nt:
         return []
     keys = nt["hs_mooncake_keys"]
+    prompt_lens = nt.get("hs_prompt_lens")
+    response_lens = nt.get("hs_response_lens")
     return [
         SampleMeta(
             mooncake_key=str(keys[i]),
@@ -76,6 +78,8 @@ def _sample_metas_from_hs_batch(hs_batch: DataProto) -> list[SampleMeta]:
             dtypes=nt["hs_dtypes"][i] if isinstance(nt["hs_dtypes"][i], dict) else {},
             seq_len=int(nt["hs_seq_lens"][i]),
             n_tokens=int(nt["hs_seq_lens"][i]),
+            prompt_len=int(prompt_lens[i]) if prompt_lens is not None else 0,
+            response_len=int(response_lens[i]) if response_lens is not None else 0,
         )
         for i in range(len(keys))
     ]

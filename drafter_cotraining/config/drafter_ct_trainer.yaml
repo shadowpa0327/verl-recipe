@@ -137,3 +137,60 @@ actor_rollout_ref:
 
     # Master switch. False = no drafter worker engine is built, update_drafter is a no-op.
     enable: False
+
+    # Optional: "eagle_forward_kl" sets the TrainingWorker's loss_fn; leave unset
+    # since update_drafter computes the 0.8^i-weighted plosses directly without
+    # going through the TrainingWorker.train_batch path.
+    loss_fn: null
+
+    # Drafter model config — converted to DrafterModelConfig dataclass in _init_drafter.
+    model_config:
+      # Path to the Eagle3 draft-model JSON config (e.g. qwen3_4b_eagle3.json).
+      # When null the drafter engine is skipped and update_drafter falls back to
+      # the shape-print smoke path. Override on the CLI.
+      local_path: null
+      dtype: bfloat16
+      ttt_length: 7
+      # Target (verifier) model path — used to load the frozen embed_tokens +
+      # lm_head + model.norm weights into the drafter at init (rank 0 reads the
+      # safetensors / HF snapshot; FSDP2 broadcasts embed, dist.broadcast handles
+      # the other two). Defaults to actor_rollout_ref.model.path so the drafter
+      # and actor agree on the target by default.
+      target_model_path: ${actor_rollout_ref.model.path}
+
+    # FSDP engine config — keys here match FSDPEngineConfig fields. Defaults are
+    # sensible for a tiny draft model on 2+ GPUs. Override from CLI if needed.
+    engine_config:
+      # FSDP1 with use_orig_params=True:
+      #  - Params stay as regular Tensors (not DTensor), so the Eagle3 loss
+      #    kernel's F.linear(input, draft_lm_head_weight) doesn't hit the
+      #    "mixed torch.Tensor and DTensor" runtime error.
+      #  - use_orig_params=True lifts FSDP1's "uniform requires_grad" restriction,
+      #    so the frozen embed_tokens + trainable fc/midlayer/norm/lm_head mix
+      #    flattens cleanly.
+      strategy: fsdp
+      use_orig_params: True
+      fsdp_size: -1
+      # Draft model is tiny; keep on GPU to avoid offload overhead dominating.
+      param_offload: False
+      optimizer_offload: False
+      use_remove_padding: False
+
+    # FSDP optimizer config — keys match FSDPOptimizerConfig. total_training_steps
+    # must be set at runtime (e.g. to micro.max_steps in the training smoke) or
+    # the cosine LR scheduler plateaus immediately. Defaults track TorchSpec's
+    # eagle3 training knobs (lr=1e-4, weight_decay=0, warmup_ratio=0.015,
+    # max_grad_norm=0.5, cosine decay) so smoke runs match its training signal.
+    optimizer_config:
+      lr: 1.0e-4
+      weight_decay: 0.0
+      lr_warmup_steps_ratio: 0.015
+      lr_scheduler_type: cosine
+      min_lr_ratio: 0.0
+      clip_grad: 0.5
+      total_training_steps: -1
+
+    # Checkpoint config — for now we don't save drafter checkpoints in the smoke.
+    checkpoint_config:
+      save_contents: ['model', 'optimizer', 'extra']
+      load_contents: ['model', 'optimizer', 'extra']

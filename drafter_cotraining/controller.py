@@ -43,13 +43,22 @@ class SequenceMeta:
 class SampleMeta:
     """Metadata for a training-ready sample after HS collection.
     Lightweight — lives in Level 2 (sample_pool) on the driver.
-    Actual tensors (hidden states) are in Mooncake, referenced by key."""
+    Actual tensors (hidden states) are in Mooncake, referenced by key.
+
+    ``prompt_len`` and ``response_len`` are the unpadded valid lengths of
+    each span in the stored Mooncake tokens (total length = prompt + response).
+    Consumed by ``update_drafter`` to build a response-only
+    ``loss_mask = [0]*prompt_len + [1]*(response_len - 1)`` (final response
+    position dropped — no valid next-token target).
+    """
 
     mooncake_key: str
     shapes: Dict[str, Tuple[int, ...]]
     dtypes: Dict[str, Any]  # torch.dtype stored as string for serialization
     seq_len: int = 0
     n_tokens: int = 0
+    prompt_len: int = 0
+    response_len: int = 0
 
 
 class DrafterDataController:
@@ -148,6 +157,12 @@ class DrafterDataController:
                 ),
                 'n_tokens': np.array(
                     [m.n_tokens for m in self._sample_pool], dtype=object
+                ),
+                'prompt_lens': np.array(
+                    [m.prompt_len for m in self._sample_pool], dtype=object
+                ),
+                'response_lens': np.array(
+                    [m.response_len for m in self._sample_pool], dtype=object
                 ),
             },
         )

@@ -62,8 +62,12 @@ class AsyncHSCollectorServerManager(AsyncLLMServerManager):
     async def compute_hidden_states_batch(self, data: DataProto) -> DataProto:
         """Run prefill-only on each sample in `data`. Returns a DataProto with mooncake metadata."""
         tasks = []
+        prompt_lens: list[int] = []
+        response_lens: list[int] = []
         for i in range(len(data)):
-            sequence_ids = _unpad_sequence_ids(data[i : i + 1])
+            sequence_ids, plen, rlen = _unpad_sequence_ids(data[i : i + 1])
+            prompt_lens.append(plen)
+            response_lens.append(rlen)
             tasks.append(asyncio.create_task(self.compute_hidden_states_single(sequence_ids)))
         results = await asyncio.gather(*tasks)
 
@@ -73,14 +77,22 @@ class AsyncHSCollectorServerManager(AsyncLLMServerManager):
                 "hs_shapes": np.array([r["shapes"] for r in results], dtype=object),
                 "hs_dtypes": np.array([r["dtypes"] for r in results], dtype=object),
                 "hs_seq_lens": np.array([r["seq_len"] for r in results], dtype=np.int64),
+                # Valid (unpadded) prompt / response lengths per sample. Feeds the
+                # drafter-side response-only loss_mask = [0]*prompt_len +
+                # [1]*(response_len - 1) (final response position dropped — no
+                # valid next-token target). Matches TorchSpec assistant-content
+                # mask semantics + sgl_engine_decode.py:249 completion_tokens-1.
+                "hs_prompt_lens": np.array(prompt_lens, dtype=np.int64),
+                "hs_response_lens": np.array(response_lens, dtype=np.int64),
             },
         )
 
 
-def _unpad_sequence_ids(data: DataProto) -> list[int]:
-    """Extract the valid (unpadded) prompt+response token ids from a single sample.
+def _unpad_sequence_ids(data: DataProto) -> tuple[list[int], int, int]:
+    """Extract (valid_tokens, prompt_len, response_len) from a single sample.
 
     Left-padded prompt concatenated with right-padded response, same layout as teacher.
+    Returned token list has length ``prompt_len + response_len``.
     """
     input_ids = data.batch["input_ids"][0]
     attention_mask = data.batch["attention_mask"][0]
@@ -88,4 +100,5 @@ def _unpad_sequence_ids(data: DataProto) -> list[int]:
     valid_prompt_length = int(attention_mask[:prompt_width].sum().item())
     valid_response_length = int(attention_mask[-data.batch["responses"][0].shape[0] :].sum().item())
     prompt_pad = prompt_width - valid_prompt_length
-    return input_ids[prompt_pad : prompt_width + valid_response_length].tolist()
+    tokens = input_ids[prompt_pad : prompt_width + valid_response_length].tolist()
+    return tokens, valid_prompt_length, valid_response_length

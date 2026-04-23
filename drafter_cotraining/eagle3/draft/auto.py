@@ -23,7 +23,7 @@ import os
 from typing import Union
 
 from transformers import AutoModelForCausalLM as AutoModelForCausalLMBase
-from transformers import LlamaConfig, PretrainedConfig, modeling_utils
+from transformers import DeepseekV3Config, LlamaConfig, PretrainedConfig, modeling_utils
 
 from recipe.drafter_cotraining.eagle3.draft.llama3_eagle import LlamaForCausalLMEagle3
 

@@ -86,14 +86,30 @@ class ActorRolloutRefDrafterWorker(ActorRolloutRefWorker):
         Uses FSDPDrafterEngine (registered as model_type="drafter_model").
         Shares embed_tokens/lm_head from actor (frozen, zero copy).
         """
+        from verl.trainer.config import CheckpointConfig
+        from verl.workers.config import FSDPEngineConfig, FSDPOptimizerConfig
         from verl.workers.engine_workers import TrainingWorker, TrainingWorkerConfig
+
+        from recipe.drafter_cotraining.drafter_engine import (
+            DrafterModelConfig,
+            build_drafter_subconfig,
+        )
 
         drafter_cfg = self.config.drafter
         drafter_training_config = TrainingWorkerConfig(
             model_type="drafter_model",
-            model_config=drafter_cfg.get("model_config", {}),
-            engine_config=drafter_cfg.get("engine_config", {}),
-            optimizer_config=drafter_cfg.get("optimizer_config", {}),
+            model_config=build_drafter_subconfig(
+                drafter_cfg.get("model_config", {}), DrafterModelConfig
+            ),
+            engine_config=build_drafter_subconfig(
+                drafter_cfg.get("engine_config", {}), FSDPEngineConfig
+            ),
+            optimizer_config=build_drafter_subconfig(
+                drafter_cfg.get("optimizer_config", {}), FSDPOptimizerConfig
+            ),
+            checkpoint_config=build_drafter_subconfig(
+                drafter_cfg.get("checkpoint_config", {}), CheckpointConfig
+            ),
         )
         self.drafter = TrainingWorker(config=drafter_training_config)
         self.drafter.reset()
@@ -146,26 +162,28 @@ class ActorRolloutRefDrafterWorker(ActorRolloutRefWorker):
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="drafter"))
     def update_drafter(self, data: DataProto):
-        """Receive per-rank shard of mooncake keys, fetch tensors, collate, log shapes.
+        """Receive per-rank shard of Mooncake keys, fetch tensors, collate, train.
 
         data is already split per DP rank by the drafter mesh dispatch fn.
         Each entry contains Mooncake keys — actual tensors fetched here.
 
-        Dispatch: make_nd_compute_dataproto_dispatch_fn(mesh_name="drafter")
-        splits DataProto.non_tensor_batch per rank via np.array_split.
-
-        Smoke version: fetch → collate → print one summary line per rank.
-        train_batch / remove_eagle3_tensors are intentionally not wired yet —
-        they land in a follow-up once the padded shapes look right.
+        When the drafter engine is initialized (``drafter.model_config.local_path``
+        is set) this runs the full Eagle3 training step (prepare_model_inputs →
+        7-step TTT forward → 0.8^i-weighted backward → optimizer step) and
+        returns all-reduced metrics in ``meta_info['train_metrics']``. When the
+        engine is absent it falls back to the shape-print smoke path so the
+        rollout+HS+dispatch pipeline can be exercised without a real draft model.
         """
         if len(data) == 0:
-            return
+            return DataProto(non_tensor_batch={})
 
         mooncake_keys = data.non_tensor_batch.get("mooncake_keys", [])
         shapes_list = data.non_tensor_batch.get("shapes", [])
         dtypes_list = data.non_tensor_batch.get("dtypes", [])
+        prompt_lens = data.non_tensor_batch.get("prompt_lens", [])
+        response_lens = data.non_tensor_batch.get("response_lens", [])
         if len(mooncake_keys) == 0:
-            return
+            return DataProto(non_tensor_batch={})
 
         import torch.distributed as dist
         rank = dist.get_rank() if dist.is_initialized() else 0
@@ -176,70 +194,185 @@ class ActorRolloutRefDrafterWorker(ActorRolloutRefWorker):
 
         device = torch.device("cuda", torch.cuda.current_device())
 
-        drafter_cfg = self.config.drafter if hasattr(self.config, "drafter") else {}
-        batch_size = drafter_cfg.get("batch_size", len(mooncake_keys)) if hasattr(drafter_cfg, "get") else len(mooncake_keys)
-        max_steps = drafter_cfg.get("max_steps", 1) if hasattr(drafter_cfg, "get") else 1
-
         from recipe.drafter_cotraining.eagle3_collator import Eagle3Collator
         collator = Eagle3Collator()
 
-        for step in range(max_steps):
-            start = step * batch_size
-            end = min(start + batch_size, len(mooncake_keys))
-            if start >= len(mooncake_keys):
-                break
-
-            features = []
-            for i in range(start, end):
-                key = str(mooncake_keys[i])
-                shapes = shapes_list[i] if isinstance(shapes_list[i], dict) else {}
-                raw_dtypes = dtypes_list[i] if isinstance(dtypes_list[i], dict) else {}
-                dtypes = {
-                    k: (getattr(torch, v) if isinstance(v, str) and hasattr(torch, v) else v)
-                    for k, v in raw_dtypes.items()
-                }
-                out = store.get(key=key, shapes=shapes, dtypes=dtypes, device=device)
-                # Add batch dim — collator expects [1, T] / [1, T, D] per sample.
-                ids = out.input_ids.unsqueeze(0) if out.input_ids.dim() == 1 else out.input_ids
-                hs = out.hidden_states.unsqueeze(0) if out.hidden_states.dim() == 2 else out.hidden_states
-                feat = {
-                    "input_ids": ids,
-                    "hidden_states": hs,
-                    "loss_mask": torch.ones_like(ids).long(),
-                }
-                if out.last_hidden_states is not None:
-                    lhs = out.last_hidden_states
-                    feat["last_hidden_states"] = lhs.unsqueeze(0) if lhs.dim() == 2 else lhs
-                features.append(feat)
-                # Force-delete Mooncake keys right after fetch (matches TorchSpec
-                # data_fetcher._cleanup_mooncake_data — frees the buffer for the
-                # next prefill while the GPU consumes this sample).
-                store.remove_eagle3_tensors(
-                    key=key,
-                    has_last_hidden_states=out.last_hidden_states is not None,
-                )
-
-            batch = collator(features)
-            lhs_shape = (
-                tuple(batch["last_hidden_states"].shape)
-                if "last_hidden_states" in batch
-                else None
+        features = []
+        for i in range(len(mooncake_keys)):
+            key = str(mooncake_keys[i])
+            shapes = shapes_list[i] if isinstance(shapes_list[i], dict) else {}
+            raw_dtypes = dtypes_list[i] if isinstance(dtypes_list[i], dict) else {}
+            dtypes = {
+                k: (getattr(torch, v) if isinstance(v, str) and hasattr(torch, v) else v)
+                for k, v in raw_dtypes.items()
+            }
+            out = store.get(key=key, shapes=shapes, dtypes=dtypes, device=device)
+            # Add batch dim — collator expects [1, T] / [1, T, D] per sample.
+            ids = out.input_ids.unsqueeze(0) if out.input_ids.dim() == 1 else out.input_ids
+            hs = out.hidden_states.unsqueeze(0) if out.hidden_states.dim() == 2 else out.hidden_states
+            # Response-only loss mask — zeros on prompt positions, ones on
+            # response positions EXCEPT the last (next-token prediction has no
+            # valid target at the final response position; matches TorchSpec
+            # sgl_engine_decode.py:249 `completion_tokens - 1` and the
+            # `loss_mask[0, -1] = 0` in preprocessing.py:329-331). When either
+            # length is missing we fall back to all-ones so the engine still
+            # runs (degraded signal).
+            seq_len = int(ids.shape[-1])
+            plen = int(prompt_lens[i]) if i < len(prompt_lens) else 0
+            rlen = int(response_lens[i]) if i < len(response_lens) else 0
+            if rlen > 1:
+                loss_mask = torch.zeros_like(ids).long()
+                # rlen-1 ones: positions [plen, plen+rlen-1) — drops the last.
+                end = min(plen + rlen - 1, seq_len)
+                loss_mask[..., plen:end] = 1
+            else:
+                loss_mask = torch.ones_like(ids).long()
+            feat = {
+                "input_ids": ids,
+                "hidden_states": hs,
+                "loss_mask": loss_mask,
+            }
+            if out.last_hidden_states is not None:
+                lhs = out.last_hidden_states
+                feat["last_hidden_states"] = lhs.unsqueeze(0) if lhs.dim() == 2 else lhs
+            features.append(feat)
+            # Force-delete Mooncake keys right after fetch (matches TorchSpec
+            # data_fetcher._cleanup_mooncake_data — frees the buffer for the
+            # next prefill while the GPU consumes this sample).
+            store.remove_eagle3_tensors(
+                key=key,
+                has_last_hidden_states=out.last_hidden_states is not None,
             )
-            print("="*100)
+
+        batch = collator(features)
+
+        if self.drafter is None:
+            # Smoke-only fallback: no drafter engine configured, so just log
+            # padded shapes per rank and exit. Keeps test_drafter_rollout_hs.py
+            # runnable without a real Eagle3 checkpoint.
+            self._log_drafter_batch_shapes(batch, rank)
+            return DataProto(non_tensor_batch=data.non_tensor_batch)
+
+        metrics = self._drafter_train_step(batch, rank)
+
+        # Also log shapes the first time through so the smoke output still
+        # contains the padded-shape sanity line.
+        if not getattr(self, "_drafter_shapes_logged", False):
+            self._log_drafter_batch_shapes(batch, rank)
+            self._drafter_shapes_logged = True
+
+        return DataProto(
+            non_tensor_batch=data.non_tensor_batch,
+            meta_info={"train_metrics": metrics},
+        )
+
+    def _log_drafter_batch_shapes(self, batch, rank: int):
+        lhs_shape = (
+            tuple(batch["last_hidden_states"].shape) if "last_hidden_states" in batch else None
+        )
+        print("=" * 100)
+        print(
+            f"[drafter rank {rank}] B={batch['input_ids'].shape[0]} "
+            f"T_pad={batch['input_ids'].shape[1]}  "
+            f"input_ids={tuple(batch['input_ids'].shape)} "
+            f"hidden_states={tuple(batch['hidden_states'].shape)} "
+            f"last_hs={lhs_shape} "
+            f"attn_mask={tuple(batch['attention_mask'].shape)} "
+            f"loss_mask={tuple(batch['loss_mask'].shape)}"
+        )
+        print("=" * 100)
+
+    def _drafter_train_step(self, batch, rank: int) -> dict:
+        """Real Eagle3 forward + 0.8^i-weighted backward + optimizer step.
+
+        Uses the drafter engine's ``train_mode`` context so parameter/optimizer
+        offload is handled consistently with how actor training runs. The
+        context also zeros grads on exit. Target model stays frozen — actor
+        updates and drafter→rollout sync are out of scope for this milestone.
+        """
+        engine = self.drafter.engine
+        device = torch.device("cuda", torch.cuda.current_device())
+
+        # Move collator output onto GPU (some entries may already be there if
+        # Eagle3Collator preserved device from per-sample tensors).
+        batch_dev = {
+            k: (v.to(device) if torch.is_tensor(v) else v) for k, v in batch.items()
+        }
+
+        with engine.train_mode():
+            prepared = engine.prepare_model_inputs(batch_dev)
+            plosses, _, acces = engine.module(**prepared)
+
+            num_ttt = len(plosses)
+            loss_weights = [0.8 ** i for i in range(num_ttt)]
+            # accumulation_steps=1 for this milestone — one rollout batch per
+            # optimizer step (see tasks/drafter-training-milestone.md §3.2).
+            loss = sum(w * p for w, p in zip(loss_weights, plosses)) / 1.0
+            loss.backward()
+
+            grad_norm = engine.optimizer_step()
+            lr = engine.lr_scheduler_step()
+
+        return self._aggregate_drafter_metrics(
+            plosses=plosses,
+            acces=acces,
+            loss_weights=loss_weights,
+            grad_norm=grad_norm,
+            lr=lr,
+            rank=rank,
+        )
+
+    def _aggregate_drafter_metrics(
+        self, plosses, acces, loss_weights, grad_norm, lr, rank: int
+    ) -> dict:
+        """All-reduce per-TTT-step plosses/acces across DP and build metrics dict."""
+        import torch.distributed as dist
+
+        # Each ploss / acc is a scalar tensor per TTT step; stack to [L].
+        avg_plosses = torch.stack([p.detach() for p in plosses])
+        avg_acces = torch.stack([a.detach() for a in acces])
+
+        dp_group = self.drafter.engine.get_data_parallel_group()
+        dist.all_reduce(avg_plosses, op=dist.ReduceOp.AVG, group=dp_group)
+        dist.all_reduce(avg_acces, op=dist.ReduceOp.AVG, group=dp_group)
+
+        plosses_list = avg_plosses.float().tolist()
+        acces_list = avg_acces.float().tolist()
+
+        # simulated_acc_len = acc_0 + acc_0·acc_1 + acc_0·acc_1·acc_2 + ...
+        cumulative, simulated_acc_len = 1.0, 0.0
+        for a in acces_list:
+            cumulative *= a
+            simulated_acc_len += cumulative
+
+        w = torch.tensor(loss_weights, device=avg_plosses.device, dtype=avg_plosses.dtype)
+        weighted_loss = (avg_plosses * w).sum().item() / float(sum(loss_weights))
+        raw_mean_loss = avg_plosses.float().mean().item()
+        avg_acc = sum(acces_list) / max(len(acces_list), 1)
+
+        metrics = {
+            "train/loss_weighted": float(weighted_loss),
+            "train/loss_raw_mean": float(raw_mean_loss),
+            "train/avg_acc": float(avg_acc),
+            "train/simulated_acc_len": float(simulated_acc_len),
+            "train/grad_norm": float(grad_norm) if grad_norm is not None else 0.0,
+            "train/lr": float(lr) if lr is not None else 0.0,
+        }
+        for i, p in enumerate(plosses_list):
+            metrics[f"train/ploss_{i}"] = float(p)
+        for i, a in enumerate(acces_list):
+            metrics[f"train/acc_{i}"] = float(a)
+
+        if rank == 0:
             print(
-                f"[drafter rank {rank}] step {step + 1}/{max_steps}: "
-                f"B={batch['input_ids'].shape[0]} T_pad={batch['input_ids'].shape[1]}  "
-                f"input_ids={tuple(batch['input_ids'].shape)} "
-                f"hidden_states={tuple(batch['hidden_states'].shape)} "
-                f"last_hs={lhs_shape} "
-                f"attn_mask={tuple(batch['attention_mask'].shape)} "
-                f"loss_mask={tuple(batch['loss_mask'].shape)}"
+                f"[drafter] loss={metrics['train/loss_weighted']:.4f} "
+                f"acc0={metrics['train/acc_0']:.4f} "
+                f"acc_len={metrics['train/simulated_acc_len']:.2f} "
+                f"grad={metrics['train/grad_norm']:.3f} "
+                f"lr={metrics['train/lr']:.2e}"
             )
-            print("="*100)
 
-        # Mesh dispatch collector expects each rank to return a concatable
-        # DataProto. Echo the input (drops meta_info that isn't per-sample).
-        return DataProto(non_tensor_batch=data.non_tensor_batch)
+        return metrics
 
     def _get_mooncake_store(self, mooncake_cfg: dict, rank: int):
         """Lazy-init a single EagleMooncakeStore, cached on self."""
