@@ -145,17 +145,24 @@ actor_rollout_ref:
 
     # Drafter model config — converted to DrafterModelConfig dataclass in _init_drafter.
     model_config:
-      # Path to the Eagle3 draft-model JSON config (e.g. qwen3_4b_eagle3.json).
-      # When null the drafter engine is skipped and update_drafter falls back to
-      # the shape-print smoke path. Override on the CLI.
+      # OPTIONAL template overlay for the draft architecture. When null
+      # (default) the draft architecture is auto-derived from
+      # target_model_path's HF AutoConfig: hidden_size, num_attention_heads,
+      # vocab_size, rope_*, rms_norm_eps, etc. inherit from target;
+      # num_hidden_layers is forced to 1 (Eagle3 invariant).
+      # Provide a JSON only to (a) activate vocab pruning (set
+      # draft_vocab_size < vocab_size), (b) target a non-Llama architecture
+      # (e.g. DeepSeek), or (c) override attention_bias / sliding_window
+      # for non-Llama targets. See generate_draft_model_config() in
+      # eagle3/draft/auto.py.
       local_path: null
       dtype: bfloat16
       ttt_length: 7
-      # Target (verifier) model path — used to load the frozen embed_tokens +
-      # lm_head + model.norm weights into the drafter at init (rank 0 reads the
-      # safetensors / HF snapshot; FSDP2 broadcasts embed, dist.broadcast handles
-      # the other two). Defaults to actor_rollout_ref.model.path so the drafter
-      # and actor agree on the target by default.
+      # Target (verifier) model path — REQUIRED. Used both to (a) auto-derive
+      # the draft architecture (above) and (b) load the frozen embed_tokens +
+      # lm_head + model.norm weights into the drafter at init (rank 0 reads
+      # the safetensors / HF snapshot, dist.broadcast handles the rest).
+      # Defaults to actor_rollout_ref.model.path so drafter and actor agree.
       target_model_path: ${actor_rollout_ref.model.path}
 
     # FSDP engine config — keys here match FSDPEngineConfig fields. Defaults are

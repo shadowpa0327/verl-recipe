@@ -197,11 +197,18 @@ class FSDPDrafterEngine(FSDPEngine):
         from recipe.drafter_cotraining.eagle3.draft.auto import AutoDraftModelConfig, AutoEagle3DraftModel
         from recipe.drafter_cotraining.eagle3.eagle3_model import Eagle3Model
 
-        assert self.model_config.local_path, (
-            "drafter.model_config.local_path must point to a draft-model JSON config"
+        target_path = getattr(self.model_config, "target_model_path", None)
+        local_path = self.model_config.local_path
+        assert target_path, (
+            "drafter.model_config.target_model_path must be set so the draft "
+            "architecture can be auto-derived from the target model. "
+            "(Provide a template at local_path only for vocab pruning or "
+            "non-Llama architectures.)"
         )
 
-        draft_config = AutoDraftModelConfig.from_file(self.model_config.local_path)
+        # Auto-derive draft architecture from the target's HF AutoConfig.
+        # local_path is an optional template overlay — see auto.py.
+        draft_config = AutoDraftModelConfig.from_target(target_path, template_path=local_path)
         draft_model = AutoEagle3DraftModel.from_config(
             draft_config,
             torch_dtype=getattr(torch, self.model_config.dtype, torch.bfloat16),
