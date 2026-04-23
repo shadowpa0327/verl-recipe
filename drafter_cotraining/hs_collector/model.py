@@ -139,7 +139,7 @@ class HSCollectorManager:
     def _initialize_async_server_manager(self):
         from verl.experimental.agent_loop.agent_loop import GlobalRequestLoadBalancer
 
-        from .hs_collector_manager import AsyncHSCollectorServerManager
+        from recipe.drafter_cotraining.hs_collector.manager import AsyncHSCollectorServerManager
 
         self.load_balancer_handle = GlobalRequestLoadBalancer.remote(server_actor_ids=self.server_addresses)
         self.server_manager = AsyncHSCollectorServerManager(

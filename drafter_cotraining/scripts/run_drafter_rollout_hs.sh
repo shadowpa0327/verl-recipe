@@ -12,7 +12,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-VERL_ROOT="$(dirname "$SCRIPT_DIR")"
+RECIPE_ROOT="$(dirname "$SCRIPT_DIR")"
+VERL_ROOT="$(cd "$RECIPE_ROOT/../.." && pwd)"
 
 # ── Defaults (override with env vars) ─────────────────────────────────
 VENV_DIR="${VENV_DIR:-$VERL_ROOT/.venv}"
@@ -54,7 +55,9 @@ sleep 1
 source "$VENV_DIR/bin/activate"
 
 export HYDRA_FULL_ERROR=1
+export PYTHONPATH="$VERL_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 
+cd "$VERL_ROOT"
 python "$SCRIPT_DIR/test_drafter_rollout_hs.py" \
     data.train_files="['$TRAIN_FILE']" \
     data.val_files="['$VAL_FILE']" \

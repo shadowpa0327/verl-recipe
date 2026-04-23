@@ -12,6 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .hs_collector_model import HSCollectorConfig, HSCollectorManager
+from recipe.drafter_cotraining.hs_collector.model import HSCollectorConfig, HSCollectorManager
 
 __all__ = ["HSCollectorConfig", "HSCollectorManager"]

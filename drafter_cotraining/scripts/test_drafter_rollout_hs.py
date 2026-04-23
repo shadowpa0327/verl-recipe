@@ -262,7 +262,7 @@ class MicroDrafterCTTaskRunner(DrafterCTTaskRunner):
 
 
 @hydra.main(
-    config_path="../verl/trainer/drafter/config",
+    config_path="../config",
     config_name="drafter_ct_trainer",
     version_base=None,
 )

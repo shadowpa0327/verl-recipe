@@ -32,7 +32,7 @@ mooncake:
 hs_collector:
 
   # Target dataclass for omega_conf_to_dataclass hydration.
-  _target_: verl.experimental.hs_collector.HSCollectorConfig
+  _target_: recipe.drafter_cotraining.hs_collector.HSCollectorConfig
 
   # Master switch. When False the trainer skips HS collection entirely.
   enabled: True
@@ -99,11 +99,11 @@ hs_collector:
         # vLLM KV transfer: write hidden states to Mooncake instead of the usual KV cache transfer.
         kv_transfer_config:
 
-          # Name of the connector class defined in verl.utils.mooncake.hidden_states_connector.
+          # Name of the connector class defined in recipe.drafter_cotraining.mooncake.hidden_states_connector.
           kv_connector: MooncakeHiddenStatesConnector
 
           # Dotted path to the connector module — vLLM discovers it without factory registration.
-          kv_connector_module_path: verl.utils.mooncake.hidden_states_connector
+          kv_connector_module_path: recipe.drafter_cotraining.mooncake.hidden_states_connector
 
           # Producer role — this connector writes, doesn't read.
           kv_role: kv_producer
