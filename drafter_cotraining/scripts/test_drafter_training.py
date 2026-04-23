@@ -23,10 +23,9 @@ Pass signal:
 Usage (via wrapper):
     scripts/run_drafter_training.sh
 
-Or directly (Hydra overrides required for drafter.model_config.local_path):
+Or directly (target_model_path defaults to actor_rollout_ref.model.path):
     python recipe/drafter_cotraining/scripts/test_drafter_training.py \
         actor_rollout_ref.drafter.enable=True \
-        actor_rollout_ref.drafter.model_config.local_path=/path/to/draft/config \
         actor_rollout_ref.drafter.optimizer_config.total_training_steps=32 \
         +micro.max_steps=32
 """
@@ -69,15 +68,18 @@ class DrafterTrainingSmokeTrainer(MicroRolloutHSOnlyTrainer):
             "(the update_drafter step performs a real forward/backward)"
         )
         model_cfg = drafter_cfg.get("model_config", {}) or {}
-        assert model_cfg.get("local_path"), (
-            "drafter.model_config.local_path must be set — the drafter engine is "
-            "skipped when this is empty, and update_drafter falls back to the "
-            "shape-print smoke path (no training). Point this at a draft config."
+        assert model_cfg.get("target_model_path"), (
+            "drafter.model_config.target_model_path must be set — the drafter "
+            "engine is skipped when this is empty, and update_drafter falls "
+            "back to the shape-print smoke path (no training). Defaults to "
+            "${actor_rollout_ref.model.path} via Hydra interpolation."
         )
 
         print("=" * 72)
         print(f"  Drafter training smoke: max_steps={max_steps}")
-        print(f"  drafter.model_config.local_path={model_cfg['local_path']}")
+        print(f"  drafter.model_config.target_model_path={model_cfg['target_model_path']}")
+        if model_cfg.get("local_path"):
+            print(f"  drafter.model_config.local_path={model_cfg['local_path']} (template overlay)")
         print(f"  use_hs_collector={self.use_hs_collector}")
         print("=" * 72)
 

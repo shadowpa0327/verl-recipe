@@ -62,12 +62,17 @@ class ActorRolloutRefDrafterWorker(ActorRolloutRefWorker):
         #    a real Eagle3 model checkpoint).
         drafter_cfg = self.config.get("drafter", {}) or {}
         model_cfg = drafter_cfg.get("model_config", {}) or {}
-        if model_cfg.get("local_path"):
+        # Drafter engine init is gated on target_model_path: the auto-derive
+        # path needs the target's HF AutoConfig to spec the draft architecture,
+        # and the frozen-weight load needs target safetensors. Without it we
+        # fall back to the shape-print smoke (rollout+HS dispatch only).
+        if model_cfg.get("target_model_path"):
             self._init_drafter()
         else:
             logger.info(
-                "drafter.model_config.local_path not set — skipping _init_drafter; "
-                "update_drafter will run the fetch+collate smoke path only."
+                "drafter.model_config.target_model_path not set — skipping "
+                "_init_drafter; update_drafter will run the fetch+collate "
+                "smoke path only."
             )
 
         # 6. Register drafter mesh (pure DP — every rank is unique).
@@ -167,7 +172,7 @@ class ActorRolloutRefDrafterWorker(ActorRolloutRefWorker):
         data is already split per DP rank by the drafter mesh dispatch fn.
         Each entry contains Mooncake keys — actual tensors fetched here.
 
-        When the drafter engine is initialized (``drafter.model_config.local_path``
+        When the drafter engine is initialized (``drafter.model_config.target_model_path``
         is set) this runs the full Eagle3 training step (prepare_model_inputs →
         7-step TTT forward → 0.8^i-weighted backward → optimizer step) and
         returns all-reduced metrics in ``meta_info['train_metrics']``. When the
