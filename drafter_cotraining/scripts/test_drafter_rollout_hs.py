@@ -6,7 +6,7 @@
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
 """
-Micro test for RayDrafterCTPPOTrainer: rollout + HS collection only.
+Micro test for RayDrafterCTPPOTrainer: rollout + HS collection + drafter shape smoke.
 
 Runs the same Hydra config as `recipe.drafter_cotraining.main_drafter_ct` —
 including `ActorRolloutRefDrafterWorker`, `HSCollectorManager`, and
@@ -18,10 +18,10 @@ exits after N steps of:
         → _sample_metas_from_hs_batch()
         → _drafter_ctrl.push_samples()
         → _drafter_ctrl.drain_as_dataproto()
-        → (print metadata, skip update_drafter)
+        → actor_rollout_wg.update_drafter()  (Mooncake fetch + collate + print padded shapes)
 
 Skipped: teacher, reward, old_log_prob, ref_log_prob, advantage, critic
-update, actor update, weight sync, checkpoint save, validation.
+update, actor update (drafter forward/backward), weight sync, checkpoint save, validation.
 
 Usage:
     # Uses the same Hydra config as main_drafter_ct_ppo.py by default
@@ -158,14 +158,10 @@ class MicroRolloutHSOnlyTrainer(RayDrafterCTPPOTrainer):
                 print(f"    {k:<24s} {v:.3f}")
 
             # Dispatch drained DataProto to the drafter mesh (each DP rank gets its
-            # shard of mooncake keys). In drafter.skeleton mode, the worker fetches
-            # tensors from Mooncake and prints per-rank shape/checksum lines.
+            # shard of mooncake keys). update_drafter fetches tensors from Mooncake,
+            # runs the collator, and prints per-rank padded-shape lines.
             drafter_cfg = self.config.actor_rollout_ref.get("drafter", {}) or {}
-            if (
-                drafter_proto is not None
-                and drafter_cfg.get("enable", False)
-                and drafter_cfg.get("skeleton", False)
-            ):
+            if drafter_proto is not None and drafter_cfg.get("enable", False):
                 from omegaconf import OmegaConf
                 drafter_proto.meta_info["mooncake_cfg"] = OmegaConf.to_container(
                     self.config.mooncake, resolve=True

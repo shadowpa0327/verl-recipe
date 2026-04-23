@@ -30,7 +30,7 @@ MAX_RESPONSE_LEN="${MAX_RESPONSE_LEN:-512}"
 ROLLOUT_MAX_MODEL_LEN="${ROLLOUT_MAX_MODEL_LEN:-1024}"
 HS_MAX_MODEL_LEN="${HS_MAX_MODEL_LEN:-$ROLLOUT_MAX_MODEL_LEN}"
 GPU_MEM="${GPU_MEM:-0.5}"
-N_GPUS="${N_GPUS:-1}"
+N_GPUS="${N_GPUS:-2}"
 
 MAX_STEPS="${MAX_STEPS:-5}"
 
@@ -47,8 +47,14 @@ if [ ! -d "$MODEL_PATH" ]; then
     echo "WARN: MODEL_PATH not a local dir — HF download will trigger: $MODEL_PATH"
 fi
 
-# Kill stale mooncake_master so our script can bind :50051 / :8090.
-pkill -f mooncake_master 2>/dev/null || true
+# Kill stale processes from prior crashed runs.
+# - mooncake_master: needs to free :50051 / :8090.
+# - VLLM::EngineCore / VLLM::Worker: zombie workers re-advertise phantom
+#   Mooncake segments to fresh masters and cause batch_put_from to fail
+#   intermittently with code=-800 (TRANSFER_FAIL).
+pkill -x mooncake_master  2>/dev/null || true
+pkill -x VLLM::EngineCore 2>/dev/null || true
+pkill -x VLLM::Worker     2>/dev/null || true
 sleep 1
 
 # shellcheck disable=SC1091

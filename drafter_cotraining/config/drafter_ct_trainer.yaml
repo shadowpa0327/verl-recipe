@@ -137,10 +137,3 @@ actor_rollout_ref:
 
     # Master switch. False = no drafter worker engine is built, update_drafter is a no-op.
     enable: False
-
-    # Skeleton mode: skip Eagle3Model/FSDP construction, only register the drafter mesh
-    # and route the mesh-dispatched DataProto into update_drafter(), which fetches the
-    # tensors from Mooncake and prints per-rank shape/checksum summaries.
-    # Useful for verifying the rollout → HS-collector → controller → drafter-mesh path
-    # without wiring a real EAGLE draft model.
-    skeleton: False

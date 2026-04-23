@@ -46,7 +46,7 @@ class ActorRolloutRefDrafterWorker(ActorRolloutRefWorker):
         self.drafter = None
         drafter_cfg = config.get("drafter", {}) or {}
         self._drafter_enabled = drafter_cfg.get("enable", False)
-        self._drafter_skeleton = drafter_cfg.get("skeleton", False)
+        self._mooncake_store = None  # lazy-init in update_drafter
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):
@@ -56,13 +56,21 @@ class ActorRolloutRefDrafterWorker(ActorRolloutRefWorker):
         if not self._drafter_enabled:
             return
 
-        # 5. Build drafter training engine (unless skeleton mode)
-        if not self._drafter_skeleton:
+        # 5. Build drafter training engine (skipped when no model config supplied —
+        #    lets you smoke-test the rollout → HS collector → mesh dispatch →
+        #    update_drafter (Mooncake fetch + collate + print) path without
+        #    a real Eagle3 model checkpoint).
+        drafter_cfg = self.config.get("drafter", {}) or {}
+        model_cfg = drafter_cfg.get("model_config", {}) or {}
+        if model_cfg.get("local_path"):
             self._init_drafter()
+        else:
+            logger.info(
+                "drafter.model_config.local_path not set — skipping _init_drafter; "
+                "update_drafter will run the fetch+collate smoke path only."
+            )
 
         # 6. Register drafter mesh (pure DP — every rank is unique).
-        #    Registered even in skeleton mode so update_drafter() receives
-        #    a mesh-dispatched per-rank DataProto shard.
         import torch.distributed as dist
         self._register_dispatch_collect_info(
             mesh_name="drafter",
@@ -70,10 +78,7 @@ class ActorRolloutRefDrafterWorker(ActorRolloutRefWorker):
             is_collect=True,
         )
 
-        logger.info(
-            "Drafter co-training initialized (%s)",
-            "skeleton" if self._drafter_skeleton else "drafter engine",
-        )
+        logger.info("Drafter co-training initialized")
 
     def _init_drafter(self):
         """Initialize the drafter training engine.
@@ -141,18 +146,17 @@ class ActorRolloutRefDrafterWorker(ActorRolloutRefWorker):
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="drafter"))
     def update_drafter(self, data: DataProto):
-        """Receive per-rank shard of mooncake keys, fetch tensors, (optionally) train.
+        """Receive per-rank shard of mooncake keys, fetch tensors, collate, log shapes.
 
         data is already split per DP rank by the drafter mesh dispatch fn.
-        Each entry contains Mooncake keys — actual tensors fetched at train time.
+        Each entry contains Mooncake keys — actual tensors fetched here.
 
         Dispatch: make_nd_compute_dataproto_dispatch_fn(mesh_name="drafter")
         splits DataProto.non_tensor_batch per rank via np.array_split.
 
-        Skeleton mode (``drafter.skeleton=True``): fetches tensors and prints a
-        per-rank summary. No train_batch. Used to verify the end-to-end path
-        rollout → HS collector → controller → mesh dispatch → Mooncake read
-        on the drafter workers without wiring a real EAGLE model.
+        Smoke version: fetch → collate → print one summary line per rank.
+        train_batch / remove_eagle3_tensors are intentionally not wired yet —
+        they land in a follow-up once the padded shapes look right.
         """
         if len(data) == 0:
             return
@@ -166,27 +170,18 @@ class ActorRolloutRefDrafterWorker(ActorRolloutRefWorker):
         import torch.distributed as dist
         rank = dist.get_rank() if dist.is_initialized() else 0
 
-        if self._drafter_skeleton:
-            self._skeleton_fetch_and_report(
-                rank=rank,
-                mooncake_keys=mooncake_keys,
-                shapes_list=shapes_list,
-                dtypes_list=dtypes_list,
-                mooncake_cfg=data.meta_info.get("mooncake_cfg", {}),
-            )
-            # mesh dispatch collector expects each rank to return a concatable
-            # DataProto. Echo the input (drops meta_info that isn't per-sample).
+        store = self._get_mooncake_store(data.meta_info.get("mooncake_cfg", {}), rank)
+        if store is None:
             return DataProto(non_tensor_batch=data.non_tensor_batch)
 
-        if self.drafter is None:
-            return
+        device = torch.device("cuda", torch.cuda.current_device())
 
-        drafter_cfg = self.config.drafter
-        max_steps = drafter_cfg.get("max_steps", 1)
-        batch_size = drafter_cfg.get("batch_size", len(data))
+        drafter_cfg = self.config.drafter if hasattr(self.config, "drafter") else {}
+        batch_size = drafter_cfg.get("batch_size", len(mooncake_keys)) if hasattr(drafter_cfg, "get") else len(mooncake_keys)
+        max_steps = drafter_cfg.get("max_steps", 1) if hasattr(drafter_cfg, "get") else 1
 
-        # Fetch tensors from Mooncake and train
-        from recipe.drafter_cotraining.mooncake import EagleMooncakeStore
+        from recipe.drafter_cotraining.eagle3_collator import Eagle3Collator
+        collator = Eagle3Collator()
 
         for step in range(max_steps):
             start = step * batch_size
@@ -194,44 +189,8 @@ class ActorRolloutRefDrafterWorker(ActorRolloutRefWorker):
             if start >= len(mooncake_keys):
                 break
 
-            batch_keys = mooncake_keys[start:end]
-            batch_shapes = shapes_list[start:end]
-            batch_dtypes = dtypes_list[start:end]
-
-            # TODO: Fetch from Mooncake and run train_batch
-            # For each key in batch_keys:
-            #   tensors = mooncake_store.get(key, shapes, dtypes, device)
-            #   self.drafter.train_batch(data=tensors)
-            #   mooncake_store.remove_eagle3_tensors(key)
-
-            logger.debug("update_drafter: step %d, keys %d-%d", step, start, end)
-
-    def _skeleton_fetch_and_report(
-        self,
-        rank: int,
-        mooncake_keys,
-        shapes_list,
-        dtypes_list,
-        mooncake_cfg: dict,
-    ):
-        """Skeleton path — fetch each key on this rank and log a summary."""
-        from recipe.drafter_cotraining.mooncake import EagleMooncakeStore
-        from recipe.drafter_cotraining.mooncake.config import MooncakeConfig
-
-        if not mooncake_cfg:
-            logger.warning("[drafter rank %d] no mooncake_cfg in meta_info; skipping fetch", rank)
-            return
-
-        mc_cfg = MooncakeConfig(**mooncake_cfg)
-        device = torch.device("cuda", torch.cuda.current_device())
-        store = EagleMooncakeStore(mc_cfg)
-        store.setup(device=device)
-
-        n = len(mooncake_keys)
-        print(f"[drafter rank {rank}] received {n} key(s); fetching via EagleMooncakeStore")
-
-        try:
-            for i in range(n):
+            features = []
+            for i in range(start, end):
                 key = str(mooncake_keys[i])
                 shapes = shapes_list[i] if isinstance(shapes_list[i], dict) else {}
                 raw_dtypes = dtypes_list[i] if isinstance(dtypes_list[i], dict) else {}
@@ -240,20 +199,63 @@ class ActorRolloutRefDrafterWorker(ActorRolloutRefWorker):
                     for k, v in raw_dtypes.items()
                 }
                 out = store.get(key=key, shapes=shapes, dtypes=dtypes, device=device)
-                hs_sum = float(out.hidden_states.to(torch.float32).sum().item())
-                lhs_info = (
-                    "None"
-                    if out.last_hidden_states is None
-                    else f"{tuple(out.last_hidden_states.shape)}"
+                # Add batch dim — collator expects [1, T] / [1, T, D] per sample.
+                ids = out.input_ids.unsqueeze(0) if out.input_ids.dim() == 1 else out.input_ids
+                hs = out.hidden_states.unsqueeze(0) if out.hidden_states.dim() == 2 else out.hidden_states
+                feat = {
+                    "input_ids": ids,
+                    "hidden_states": hs,
+                    "loss_mask": torch.ones_like(ids).long(),
+                }
+                if out.last_hidden_states is not None:
+                    lhs = out.last_hidden_states
+                    feat["last_hidden_states"] = lhs.unsqueeze(0) if lhs.dim() == 2 else lhs
+                features.append(feat)
+                # Force-delete Mooncake keys right after fetch (matches TorchSpec
+                # data_fetcher._cleanup_mooncake_data — frees the buffer for the
+                # next prefill while the GPU consumes this sample).
+                store.remove_eagle3_tensors(
+                    key=key,
+                    has_last_hidden_states=out.last_hidden_states is not None,
                 )
-                print(
-                    f"[drafter rank {rank}] sample[{i}] key={key} "
-                    f"hs={tuple(out.hidden_states.shape)} "
-                    f"ids={tuple(out.input_ids.shape)} lhs={lhs_info} "
-                    f"hs_sum={hs_sum:.3e}"
-                )
-        finally:
-            store.close()
+
+            batch = collator(features)
+            lhs_shape = (
+                tuple(batch["last_hidden_states"].shape)
+                if "last_hidden_states" in batch
+                else None
+            )
+            print("="*100)
+            print(
+                f"[drafter rank {rank}] step {step + 1}/{max_steps}: "
+                f"B={batch['input_ids'].shape[0]} T_pad={batch['input_ids'].shape[1]}  "
+                f"input_ids={tuple(batch['input_ids'].shape)} "
+                f"hidden_states={tuple(batch['hidden_states'].shape)} "
+                f"last_hs={lhs_shape} "
+                f"attn_mask={tuple(batch['attention_mask'].shape)} "
+                f"loss_mask={tuple(batch['loss_mask'].shape)}"
+            )
+            print("="*100)
+
+        # Mesh dispatch collector expects each rank to return a concatable
+        # DataProto. Echo the input (drops meta_info that isn't per-sample).
+        return DataProto(non_tensor_batch=data.non_tensor_batch)
+
+    def _get_mooncake_store(self, mooncake_cfg: dict, rank: int):
+        """Lazy-init a single EagleMooncakeStore, cached on self."""
+        if self._mooncake_store is not None:
+            return self._mooncake_store
+        if not mooncake_cfg:
+            logger.warning("[drafter rank %d] no mooncake_cfg in meta_info; skipping fetch", rank)
+            return None
+        from recipe.drafter_cotraining.mooncake import EagleMooncakeStore
+        from recipe.drafter_cotraining.mooncake.config import MooncakeConfig
+        mc_cfg = MooncakeConfig(**mooncake_cfg)
+        device = torch.device("cuda", torch.cuda.current_device())
+        store = EagleMooncakeStore(mc_cfg)
+        store.setup(device=device)
+        self._mooncake_store = store
+        return store
 
     # ── Weight Sync ───────────────────────────────────────────
 
