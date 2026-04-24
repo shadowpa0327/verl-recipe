@@ -413,6 +413,63 @@ class ActorRolloutRefDrafterWorker(ActorRolloutRefWorker):
 
     # ── Weight Sync ───────────────────────────────────────────
 
+    def _iter_rollout_drafter_snapshot(self, randomize: bool, seed: int):
+        snapshot = getattr(self, "_rollout_drafter_weight_sync_snapshot", None)
+        if snapshot is None:
+            raise RuntimeError("No rollout drafter snapshot cached on this rank.")
+
+        generator = None
+        if randomize:
+            import torch.distributed as dist
+
+            rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+            generator = torch.Generator(device="cpu")
+            generator.manual_seed(seed + rank)
+
+        for name, tensor in snapshot:
+            if randomize and tensor.is_floating_point():
+                randomized = torch.empty_like(tensor)
+                randomized.normal_(generator=generator)
+                yield name, randomized
+            else:
+                yield name, tensor
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
+    async def update_rollout_drafter_weights_from_snapshot(self, mode: str = "restore", seed: int = 2026):
+        """TEST_ONLY: push random/restored drafter weights through verl IPC.
+
+        Self-caching: first call fetches the baseline drafter state_dict from
+        vLLM workers via ``self.rollout.get_drafter_weights()`` and stashes it
+        on this rank. Subsequent calls reuse the cache. Pushes through
+        ``ServerAdapter.update_drafter_weights`` → server-side shared-name
+        filter → ``drafter.model.load_weights``.
+        """
+        if self.rollout is None:
+            return {"ok": False, "reason": "rollout is not initialized"}
+        if mode not in {"random", "restore"}:
+            raise ValueError(f"mode must be 'random' or 'restore', got {mode!r}")
+
+        # Lazy one-shot cache of baseline drafter weights (CPU side).
+        if getattr(self, "_rollout_drafter_weight_sync_snapshot", None) is None:
+            reports = await self.rollout.get_drafter_weights()
+            if isinstance(reports, list):
+                rollout_rank = getattr(self.rollout, "rollout_rank", 0)
+                report = reports[rollout_rank] if rollout_rank < len(reports) else None
+            else:
+                report = reports
+            if not report or not report.get("ok", False):
+                reason = report.get("reason") if report else "missing snapshot report"
+                return {"ok": False, "reason": reason}
+            self._rollout_drafter_weight_sync_snapshot = report["weights"]
+
+        weights = self._iter_rollout_drafter_snapshot(randomize=(mode == "random"), seed=seed)
+        await self.rollout.update_drafter_weights(weights)
+        return {
+            "ok": True,
+            "mode": mode,
+            "num_tensors": len(self._rollout_drafter_weight_sync_snapshot),
+        }
+
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
     async def update_weights(self, global_steps: int = None):
         """Sync actor + drafter weights to rollout.
@@ -435,6 +492,4 @@ class ActorRolloutRefDrafterWorker(ActorRolloutRefWorker):
         if self.drafter is not None and self.rollout is not None:
             # Drafter → rollout (for speculative decoding at inference time)
             drafter_params, _ = self.drafter.engine.get_per_tensor_param()
-            # TODO: self.rollout.update_drafter_weights(drafter_params)
-            # Requires rollout to support drafter weight updates
-            pass
+            await self.rollout.update_drafter_weights(drafter_params)
