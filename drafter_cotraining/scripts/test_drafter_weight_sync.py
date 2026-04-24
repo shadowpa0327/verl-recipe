@@ -53,6 +53,9 @@ import sys
 import uuid
 from pprint import pprint
 
+# vLLM collective_rpc payloads can include CPU tensors in this smoke.
+os.environ.setdefault("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+
 import hydra
 import numpy as np
 import ray

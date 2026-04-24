@@ -413,6 +413,11 @@ class ActorRolloutRefDrafterWorker(ActorRolloutRefWorker):
 
     # ── Weight Sync ───────────────────────────────────────────
 
+    def _load_rollout_drafter_snapshot(self, report: dict):
+        if "weights_path" in report:
+            return torch.load(report["weights_path"], map_location="cpu", weights_only=True)
+        return report["weights"]
+
     def _iter_rollout_drafter_snapshot(self, randomize: bool, seed: int):
         snapshot = getattr(self, "_rollout_drafter_weight_sync_snapshot", None)
         if snapshot is None:
@@ -426,7 +431,19 @@ class ActorRolloutRefDrafterWorker(ActorRolloutRefWorker):
             generator = torch.Generator(device="cpu")
             generator.manual_seed(seed + rank)
 
-        for name, tensor in snapshot:
+        items = snapshot.items() if isinstance(snapshot, dict) else snapshot
+        for item in items:
+            if not isinstance(item, (tuple, list)) or len(item) != 2:
+                raise TypeError(f"Expected snapshot item to be a (name, tensor) pair, got {type(item).__name__}: {item!r}")
+            name, tensor = item
+            if not isinstance(name, str):
+                raise TypeError(f"Expected snapshot tensor name to be str, got {type(name).__name__}: {name!r}")
+            if not isinstance(tensor, torch.Tensor):
+                if isinstance(tensor, (str, bytes, dict)):
+                    raise TypeError(
+                        f"Expected snapshot value for {name!r} to be tensor-like, got {type(tensor).__name__}"
+                    )
+                tensor = torch.as_tensor(tensor)
             if randomize and tensor.is_floating_point():
                 randomized = torch.empty_like(tensor)
                 randomized.normal_(generator=generator)
@@ -460,7 +477,7 @@ class ActorRolloutRefDrafterWorker(ActorRolloutRefWorker):
             if not report or not report.get("ok", False):
                 reason = report.get("reason") if report else "missing snapshot report"
                 return {"ok": False, "reason": reason}
-            self._rollout_drafter_weight_sync_snapshot = report["weights"]
+            self._rollout_drafter_weight_sync_snapshot = self._load_rollout_drafter_snapshot(report)
 
         weights = self._iter_rollout_drafter_snapshot(randomize=(mode == "random"), seed=seed)
         await self.rollout.update_drafter_weights(weights)
