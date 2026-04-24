@@ -330,6 +330,69 @@ class FSDPDrafterEngine(FSDPEngine):
             "set; drafter's frozen weights will remain at random init."
         )
 
+    # ------------------------------------------------------------------
+    # Checkpoint save — Eagle3-aware HF export alongside sharded state
+    # ------------------------------------------------------------------
+
+    def save_checkpoint(
+        self,
+        local_path: str,
+        hdfs_path: Optional[str] = None,
+        global_step: int = 0,
+        max_ckpt_to_keep: Optional[int] = None,
+        **kwargs,
+    ) -> None:
+        """Sharded FSDP save + drafter-specific ``model.safetensors`` export.
+
+        Verl's stock ``hf_model`` save path rebuilds via
+        ``AutoModelForCausalLM.from_config`` — ``LlamaForCausalLMEagle3``
+        isn't registered with HF's AutoModel, so that would silently
+        instantiate a vanilla ``LlamaForCausalLM`` and drop every Eagle3
+        tensor as unexpected. We write ``model.safetensors`` directly next
+        to the ``config.json`` the parent already dumps from
+        ``unwrap_model.config`` (which is the real HF ``LlamaConfig`` we
+        set in ``_build_module``).
+
+        Keep ``checkpoint_config.save_contents`` at the default
+        ``["model", "optimizer", "extra"]`` for the drafter — do NOT
+        include ``"hf_model"`` (that would trigger the broken path).
+        """
+        import os
+
+        import torch.distributed as dist
+        from safetensors.torch import save_file
+
+        from verl.utils.fsdp_utils import get_fsdp_full_state_dict
+
+        super().save_checkpoint(
+            local_path=local_path,
+            hdfs_path=hdfs_path,
+            global_step=global_step,
+            max_ckpt_to_keep=max_ckpt_to_keep,
+            **kwargs,
+        )
+
+        full_state = get_fsdp_full_state_dict(
+            self.module, offload_to_cpu=True, rank0_only=True
+        )
+
+        if dist.get_rank() == 0:
+            prefix = "draft_model."
+            extracted = {
+                k[len(prefix):]: v
+                for k, v in full_state.items()
+                if k.startswith(prefix)
+            }
+            hf_path = os.path.join(local_path, "huggingface")
+            os.makedirs(hf_path, exist_ok=True)
+            save_file(extracted, os.path.join(hf_path, "model.safetensors"))
+            logger.info(
+                "Saved drafter HF export: %s/model.safetensors (%d tensors)",
+                hf_path, len(extracted),
+            )
+
+        dist.barrier()
+
     def _get_draft_model(self):
         """Get the underlying draft model from Eagle3Model wrapper.
 

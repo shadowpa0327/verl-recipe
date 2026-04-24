@@ -76,6 +76,12 @@ class Eagle3Model(nn.Module):
         self.gradient_checkpointing = gradient_checkpointing
         self.vocab_pruning = draft_model.vocab_size != draft_model.target_vocab_size
 
+    def can_generate(self) -> bool:
+        # Satisfies FSDPCheckpointManager.save_checkpoint, which probes this
+        # on the unwrapped module to decide whether to emit a GenerationConfig.
+        # Eagle3's TTT forward is not HF-generate compatible — so: no.
+        return False
+
     def _calculate_loss(
         self,
         hidden_states: torch.Tensor,

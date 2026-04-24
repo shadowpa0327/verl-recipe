@@ -122,6 +122,44 @@ class RayDrafterCTPPOTrainer(RayPPOTrainer):
                 resource_pool=actor_pool,
             )
 
+    # ── Checkpoint ────────────────────────────────────────────────────────────
+
+    def _save_checkpoint(self):
+        """Extend base save with a drafter checkpoint under ``global_step_N/drafter/``.
+
+        Drafter save runs first so a failure there aborts the save before the
+        base writes ``latest_checkpointed_iteration.txt`` and advances resume
+        state. The worker-side ``save_drafter_checkpoint`` short-circuits when
+        the drafter engine isn't built (smoke path), so this is safe to call
+        unconditionally — but we still gate on ``drafter.enable`` to avoid an
+        unnecessary dispatch round-trip.
+        """
+        drafter_cfg = self.config.actor_rollout_ref.get("drafter", {}) or {}
+        if drafter_cfg.get("enable", False):
+            local_global_step_folder = os.path.join(
+                self.config.trainer.default_local_dir,
+                f"global_step_{self.global_steps}",
+            )
+            drafter_local_path = os.path.join(local_global_step_folder, "drafter")
+            drafter_remote_path = (
+                None
+                if self.config.trainer.default_hdfs_dir is None
+                else os.path.join(
+                    self.config.trainer.default_hdfs_dir,
+                    f"global_step_{self.global_steps}",
+                    "drafter",
+                )
+            )
+            max_drafter_ckpt_to_keep = self.config.trainer.get("max_actor_ckpt_to_keep", None)
+            self.actor_rollout_wg.save_drafter_checkpoint(
+                drafter_local_path,
+                drafter_remote_path,
+                self.global_steps,
+                max_ckpt_to_keep=max_drafter_ckpt_to_keep,
+            )
+
+        super()._save_checkpoint()
+
     # ── HS collector colocate hooks (mirror _compute_teacher_colocate) ────────────
 
     def _should_compute_hidden_states_colocate(self, batch: DataProto) -> bool:

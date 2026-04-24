@@ -395,6 +395,22 @@ class ActorRolloutRefDrafterWorker(ActorRolloutRefWorker):
         self._mooncake_store = store
         return store
 
+    # ── Checkpoint ────────────────────────────────────────────
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def save_drafter_checkpoint(
+        self, local_path, hdfs_path=None, global_step=0, max_ckpt_to_keep=None
+    ):
+        """Save drafter-engine checkpoint. Bypasses the parent's actor-only assert.
+
+        ``self.drafter`` is a TrainingWorker whose ``save_checkpoint`` forwards
+        to ``FSDPDrafterEngine.save_checkpoint``, which writes sharded FSDP
+        state + ``huggingface/{config.json, model.safetensors}``.
+        """
+        if self.drafter is None:
+            return
+        self.drafter.save_checkpoint(local_path, hdfs_path, global_step, max_ckpt_to_keep)
+
     # ── Weight Sync ───────────────────────────────────────────
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)

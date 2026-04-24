@@ -26,11 +26,11 @@ Usage (via wrapper):
 Or directly (target_model_path defaults to actor_rollout_ref.model.path):
     python recipe/drafter_cotraining/scripts/test_drafter_training.py \
         actor_rollout_ref.drafter.enable=True \
-        actor_rollout_ref.drafter.optimizer_config.total_training_steps=32 \
-        +micro.max_steps=32
+        actor_rollout_ref.drafter.optimizer_config.total_training_steps=625 \
+        data.train_max_samples=1000 \
+        trainer.total_epochs=5
 """
 
-import itertools
 import os
 import socket
 import sys
@@ -59,8 +59,11 @@ class DrafterTrainingSmokeTrainer(MicroRolloutHSOnlyTrainer):
         from omegaconf import OmegaConf
 
         cfg_micro = self.config.get("micro", {}) or {}
-        max_steps = int(cfg_micro.get("max_steps", 32))
         log_every = int(cfg_micro.get("log_every", 1))
+
+        num_epochs = int(self.config.trainer.total_epochs)
+        steps_per_epoch = len(self.train_dataloader)
+        total_steps = num_epochs * steps_per_epoch
 
         drafter_cfg = self.config.actor_rollout_ref.get("drafter", {}) or {}
         assert drafter_cfg.get("enable", False), (
@@ -76,7 +79,10 @@ class DrafterTrainingSmokeTrainer(MicroRolloutHSOnlyTrainer):
         )
 
         print("=" * 72)
-        print(f"  Drafter training smoke: max_steps={max_steps}")
+        print(
+            f"  Drafter training smoke: epochs={num_epochs}, "
+            f"steps/epoch={steps_per_epoch}, total_steps={total_steps}"
+        )
         print(f"  drafter.model_config.target_model_path={model_cfg['target_model_path']}")
         if model_cfg.get("local_path"):
             print(f"  drafter.model_config.local_path={model_cfg['local_path']} (template overlay)")
@@ -86,85 +92,107 @@ class DrafterTrainingSmokeTrainer(MicroRolloutHSOnlyTrainer):
         self._load_checkpoint()
         self.checkpoint_manager.update_weights(0)
 
-        # itertools.cycle = verl analogue of controller.reload_dataset() at
-        # epoch boundary — same prompts replayed with freshly-sampled rollouts.
-        data_iter = itertools.cycle(self.train_dataloader)
-
         loss_trace: list[float] = []
         acc_len_trace: list[float] = []
         mooncake_cfg_container = OmegaConf.to_container(self.config.mooncake, resolve=True)
 
-        for step in range(max_steps):
-            batch_dict = next(data_iter)
-            timing_raw: dict = {}
+        # RayDrafterCTPPOTrainer._save_checkpoint reads self.global_steps for
+        # the ``global_step_{N}`` directory name — normally maintained by the
+        # real fit(), but our smoke loop skips that path.
+        self.global_steps = 0
 
-            batch = DataProto.from_single_dict(batch_dict)
-            batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
-            batch.non_tensor_batch["uid"] = np.array(
-                [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
-            )
+        for epoch in range(num_epochs):
+            for batch_idx, batch_dict in enumerate(self.train_dataloader):
+                timing_raw: dict = {}
 
-            gen_batch = self._get_gen_batch(batch)
-            gen_batch.meta_info["global_steps"] = step + 1
-            gen_batch_output = gen_batch.repeat(
-                repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
-            )
-
-            with marked_timer("gen", timing_raw, color="red"):
-                gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
-                self.checkpoint_manager.sleep_replicas()
-                timing_raw.update(gen_batch_output.meta_info.get("timing", {}) or {})
-                gen_batch_output.meta_info.pop("timing", None)
-
-            batch = batch.repeat(
-                repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
-            )
-            batch = batch.union(gen_batch_output)
-
-            if not self._should_compute_hidden_states_colocate(batch):
-                print("  WARN: hs_collector is disabled — cannot train drafter without HS")
-                break
-
-            with marked_timer("hs_collect", timing_raw, color="cyan"):
-                hs_batch = self._compute_hidden_states_colocate(batch)
-                sample_metas = _sample_metas_from_hs_batch(hs_batch)
-                self._drafter_ctrl.push_samples(sample_metas)
-                drafter_proto = self._drafter_ctrl.drain_as_dataproto()
-
-            if drafter_proto is None:
-                print(f"  step {step}: drafter controller has no samples to drain, skipping")
-                continue
-
-            drafter_proto.meta_info["mooncake_cfg"] = mooncake_cfg_container
-
-            with marked_timer("drafter_train", timing_raw, color="magenta"):
-                results = self.actor_rollout_wg.update_drafter(drafter_proto)
-
-            metrics = (
-                results.meta_info.get("train_metrics", {})
-                if results is not None and hasattr(results, "meta_info")
-                else {}
-            )
-            loss_trace.append(metrics.get("train/loss_weighted", float("nan")))
-            acc_len_trace.append(metrics.get("train/simulated_acc_len", float("nan")))
-
-            if step % log_every == 0:
-                print(
-                    f"step {step:4d} | "
-                    f"loss={metrics.get('train/loss_weighted', float('nan')):.4f} "
-                    f"loss_raw={metrics.get('train/loss_raw_mean', float('nan')):.4f} "
-                    f"acc0={metrics.get('train/acc_0', float('nan')):.4f} "
-                    f"acc_len={metrics.get('train/simulated_acc_len', float('nan')):.2f} "
-                    f"grad={metrics.get('train/grad_norm', float('nan')):.3f} "
-                    f"lr={metrics.get('train/lr', float('nan')):.2e} "
-                    f"| gen={timing_raw.get('gen', 0):.2f}s "
-                    f"hs={timing_raw.get('hs_collect', 0):.2f}s "
-                    f"train={timing_raw.get('drafter_train', 0):.2f}s"
+                batch = DataProto.from_single_dict(batch_dict)
+                batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
+                batch.non_tensor_batch["uid"] = np.array(
+                    [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
                 )
 
-            # Keeps rollout awake (naive backend -> effectively a no-op sync).
-            if step + 1 < max_steps:
-                self.checkpoint_manager.update_weights(step + 1)
+                gen_batch = self._get_gen_batch(batch)
+                gen_batch.meta_info["global_steps"] = self.global_steps + 1
+                gen_batch_output = gen_batch.repeat(
+                    repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
+                )
+
+                with marked_timer("gen", timing_raw, color="red"):
+                    gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
+                    self.checkpoint_manager.sleep_replicas()
+                    timing_raw.update(gen_batch_output.meta_info.get("timing", {}) or {})
+                    gen_batch_output.meta_info.pop("timing", None)
+
+                batch = batch.repeat(
+                    repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
+                )
+                batch = batch.union(gen_batch_output)
+
+                if not self._should_compute_hidden_states_colocate(batch):
+                    print("  WARN: hs_collector is disabled — cannot train drafter without HS")
+                    break
+
+                with marked_timer("hs_collect", timing_raw, color="cyan"):
+                    hs_batch = self._compute_hidden_states_colocate(batch)
+                    sample_metas = _sample_metas_from_hs_batch(hs_batch)
+                    self._drafter_ctrl.push_samples(sample_metas)
+                    drafter_proto = self._drafter_ctrl.drain_as_dataproto()
+
+                if drafter_proto is None:
+                    print(
+                        f"  epoch {epoch} step {batch_idx}: "
+                        f"drafter controller has no samples to drain, skipping"
+                    )
+                    continue
+
+                drafter_proto.meta_info["mooncake_cfg"] = mooncake_cfg_container
+
+                with marked_timer("drafter_train", timing_raw, color="magenta"):
+                    results = self.actor_rollout_wg.update_drafter(drafter_proto)
+
+                metrics = (
+                    results.meta_info.get("train_metrics", {})
+                    if results is not None and hasattr(results, "meta_info")
+                    else {}
+                )
+                loss_trace.append(metrics.get("train/loss_weighted", float("nan")))
+                acc_len_trace.append(metrics.get("train/simulated_acc_len", float("nan")))
+
+                if self.global_steps % log_every == 0:
+                    print(
+                        f"epoch {epoch:2d} step {batch_idx:4d} "
+                        f"(global {self.global_steps:5d}/{total_steps}) | "
+                        f"loss={metrics.get('train/loss_weighted', float('nan')):.4f} "
+                        f"loss_raw={metrics.get('train/loss_raw_mean', float('nan')):.4f} "
+                        f"acc0={metrics.get('train/acc_0', float('nan')):.4f} "
+                        f"acc_len={metrics.get('train/simulated_acc_len', float('nan')):.2f} "
+                        f"grad={metrics.get('train/grad_norm', float('nan')):.3f} "
+                        f"lr={metrics.get('train/lr', float('nan')):.2e} "
+                        f"| gen={timing_raw.get('gen', 0):.2f}s "
+                        f"hs={timing_raw.get('hs_collect', 0):.2f}s "
+                        f"train={timing_raw.get('drafter_train', 0):.2f}s"
+                    )
+
+                self.global_steps += 1
+                # Keeps rollout awake (naive backend -> effectively a no-op sync).
+                if self.global_steps < total_steps:
+                    self.checkpoint_manager.update_weights(self.global_steps)
+
+        # Exercise the drafter save path end-to-end: writes sharded FSDP state
+        # + HF-format export to ``{default_local_dir}/global_step_N/drafter/``.
+        # Gated on ``micro.save_at_end`` (default True) so the smoke can still
+        # be run in no-disk-writes mode by passing +micro.save_at_end=False.
+        if bool(cfg_micro.get("save_at_end", True)) and self.global_steps > 0:
+            with marked_timer("save_checkpoint", {}, color="green"):
+                self._save_checkpoint()
+            save_root = os.path.join(
+                self.config.trainer.default_local_dir,
+                f"global_step_{self.global_steps}",
+                "drafter",
+            )
+            print(f"\n  Drafter checkpoint saved to: {save_root}")
+            print(f"    sharded FSDP:  model_world_size_*_rank_*.pt")
+            print(f"    HF export:     huggingface/{{config.json, model.safetensors}}")
 
         print("\n" + "=" * 72)
         print(f"  Completed {len(loss_trace)} training step(s).")
