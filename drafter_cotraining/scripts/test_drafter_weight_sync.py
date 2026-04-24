@@ -179,6 +179,24 @@ class DrafterWeightSyncSmokeTrainer(MicroRolloutHSOnlyTrainer):
         print(f"sample output: {sample!r}")
         return acceptance, norms
 
+    def _sync_rollout_drafter_from_snapshot(self, mode: str, seed: int) -> list[dict]:
+        method = "update_rollout_drafter_weights_from_snapshot"
+        if hasattr(self.actor_rollout_wg, method):
+            refs = getattr(self.actor_rollout_wg, method)(mode=mode, seed=seed)
+        else:
+            # Colocated WorkerDict exposes methods with the spawned role prefix.
+            prefix = getattr(self.actor_rollout_wg, "sub_cls_name", "")
+            prefixed_method = f"{prefix}_{method}" if prefix else method
+            refs = self.actor_rollout_wg.execute_all_async(prefixed_method, mode=mode, seed=seed)
+
+        reports = ray.get(refs)
+        if not isinstance(reports, list):
+            reports = [reports]
+        failures = [r for r in reports if not isinstance(r, dict) or not r.get("ok", False)]
+        if failures:
+            raise RuntimeError(f"Failed to {mode} rollout drafter weights: {failures}")
+        return reports
+
     def _validate_rollout_speculative_config(self):
         from omegaconf import OmegaConf
 
@@ -237,15 +255,11 @@ class DrafterWeightSyncSmokeTrainer(MicroRolloutHSOnlyTrainer):
 
         baseline, baseline_norms = self._run_phase("Phase 1: baseline EAGLE3", 1)
 
-        ray.get(
-            self.actor_rollout_wg.update_rollout_drafter_weights_from_snapshot(
-                mode="random", seed=random_seed
-            )
-        )
+        self._sync_rollout_drafter_from_snapshot(mode="random", seed=random_seed)
         randomized, randomized_norms = self._run_phase("Phase 2: random EAGLE3 weights via verl IPC", 2)
         self._assert_target_norms_stable(baseline_norms, randomized_norms, norm_tol)
 
-        ray.get(self.actor_rollout_wg.update_rollout_drafter_weights_from_snapshot(mode="restore"))
+        self._sync_rollout_drafter_from_snapshot(mode="restore", seed=random_seed)
         restored, restored_norms = self._run_phase("Phase 3: restored EAGLE3 weights via verl IPC", 3)
         self._assert_target_norms_stable(baseline_norms, restored_norms, norm_tol)
 
