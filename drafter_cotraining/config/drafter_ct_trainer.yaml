@@ -158,6 +158,8 @@ actor_rollout_ref:
       local_path: null
       dtype: bfloat16
       ttt_length: 7
+      # Draft attention backend: flex_attention or fa4.
+      attention_backend: flex_attention
       # Target (verifier) model path — REQUIRED. Used both to (a) auto-derive
       # the draft architecture (above) and (b) load the frozen embed_tokens +
       # lm_head + model.norm weights into the drafter at init (rank 0 reads

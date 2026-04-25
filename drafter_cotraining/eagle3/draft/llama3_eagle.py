@@ -18,6 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import logging
 import math
 from typing import Optional, Tuple
 
@@ -29,23 +30,42 @@ from transformers.activations import ACT2FN
 from transformers.models.llama.configuration_llama import LlamaConfig
 
 from recipe.drafter_cotraining.eagle3.draft.base import Eagle3DraftModel
-# flex_attention ops — optional, fallback to SDPA if unavailable
-try:
-    from torchspec.models.ops.flex_attention import (
-        compile_friendly_create_block_mask,
-        compile_friendly_flex_attention,
-        generate_eagle3_mask,
-    )
-except ImportError:
-    compile_friendly_create_block_mask = None
-    compile_friendly_flex_attention = None
-    generate_eagle3_mask = None
-import logging
+from recipe.drafter_cotraining.eagle3.ops.flex_attention import (
+    compile_friendly_create_block_mask,
+    compile_friendly_flex_attention,
+    generate_eagle3_mask,
+)
+
 logger = logging.getLogger(__name__)
-def print_with_rank(*args, **kwargs): logger.info(*args)
+
+
+def print_with_rank(*args, **kwargs):
+    logger.info(*args)
 
 _flash_attn_import_error: ImportError | None = None
 try:
+    # cutlass-dsl >= 4.4.2 removed cutlass.utils.ampere_helpers, but FA4
+    # still imports it for SMEM_CAPACITY. Inject a shim before any FA4 import.
+    import importlib  # noqa: E401
+    import importlib.util
+
+    if importlib.util.find_spec("cutlass.utils") and not importlib.util.find_spec(
+        "cutlass.utils.ampere_helpers"
+    ):
+        import types  # noqa: E401
+
+        import cutlass.utils
+
+        _shim = types.ModuleType("cutlass.utils.ampere_helpers")
+        _shim.SMEM_CAPACITY = {
+            "sm80": (164 - 1) * 1024,
+            "sm86": (100 - 1) * 1024,
+            "sm89": (100 - 1) * 1024,
+        }
+        import sys
+
+        sys.modules["cutlass.utils.ampere_helpers"] = _shim
+
     from flash_attn.cute import flash_attn_func as _flash_attn_func
     from flash_attn.cute.interface import _flash_attn_bwd, _flash_attn_fwd
 except ImportError as _e:
@@ -53,6 +73,60 @@ except ImportError as _e:
     _flash_attn_func = None
     _flash_attn_fwd = None
     _flash_attn_bwd = None
+
+
+def _import_standard_flash_attn():
+    try:
+        import flash_attn as mod
+        from flash_attn import flash_attn_varlen_func as varlen_func
+        from flash_attn.bert_padding import pad_input, unpad_input
+        from flash_attn.flash_attn_interface import (
+            _flash_attn_backward as backward,
+        )
+        from flash_attn.flash_attn_interface import (
+            _flash_attn_forward as forward,
+        )
+        from flash_attn.flash_attn_interface import (
+            _flash_attn_varlen_backward as varlen_backward,
+        )
+        from flash_attn.flash_attn_interface import (
+            _flash_attn_varlen_forward as varlen_forward,
+        )
+    except ImportError as exc:
+        return None, None, None, None, None, None, None, None, exc
+
+    return (
+        mod,
+        varlen_func,
+        pad_input,
+        unpad_input,
+        forward,
+        backward,
+        varlen_forward,
+        varlen_backward,
+        None,
+    )
+
+
+(
+    _std_flash_attn_mod,
+    _std_flash_attn_varlen_func,
+    _std_flash_pad_input,
+    _std_flash_unpad_input,
+    _std_flash_attn_forward,
+    _std_flash_attn_backward,
+    _std_flash_attn_varlen_forward,
+    _std_flash_attn_varlen_backward,
+    _std_flash_attn_import_error,
+) = _import_standard_flash_attn()
+
+
+def _raise_standard_flash_attn_unavailable() -> None:
+    raise RuntimeError(
+        "LlamaFlashAttention requires the standard flash-attn interface "
+        f"(import error: {_std_flash_attn_import_error!r})"
+    )
+
 
 try:
     import cutlass
@@ -852,18 +926,10 @@ def _build_eagle3_mask_pair(
     SM100+: uses the mode selected by set_eagle3_mask_mode().
     """
     mode = _effective_mask_mode()
-    mask_mod_flex = None
     aux_tensors = None
 
     if mode == "closure":
         mask_mod_cute = _make_eagle3_flash_mask_mod(q_len, q_len)
-        seq_lengths = torch.full((bsz,), q_len, dtype=torch.long, device=device)
-        mask_mod_flex = generate_eagle3_mask(
-            seq_lengths=seq_lengths,
-            Q_LEN=q_len,
-            KV_LEN=kv_len,
-            lck=lck,
-        )
     elif mode == "simple":
         mask_mod_cute = _make_eagle3_flash_mask_mod_simple(q_len)
     elif mode == "dynamic":
@@ -876,36 +942,78 @@ def _build_eagle3_mask_pair(
     else:
         raise ValueError(f"Unknown eagle3 mask mode {mode!r}")
 
+    # Always build a flex-compatible mask_mod for block-sparse iteration.
+    seq_lengths = torch.full((bsz,), q_len, dtype=torch.long, device=device)
+    mask_mod_flex = generate_eagle3_mask(
+        seq_lengths=seq_lengths,
+        Q_LEN=q_len,
+        KV_LEN=kv_len,
+        lck=lck,
+    )
+
     return mask_mod_cute, mask_mod_flex, aux_tensors
 
 
-# Two-level cache for SM90 backward block-sparse tensors.
-# Level 1 (_bwd_bm_raw_cache): B=1, H=1 raw Q-direction index tensors.
-#   Key: (q_len, kv_len, max_seq_len, device_index)
-# Level 2 (_bwd_block_sparse_cache): expanded BlockSparseTensorsTorch.
-#   Key: (q_len, kv_len, bsz, num_heads, max_seq_len, device_index)
-_bwd_bm_raw_cache: dict = {}
-_bwd_block_sparse_cache: dict = {}
+# Block-sparse tensor caches for FA4 forward and backward.
+#
+# BlockMask.as_tuple(flatten=True) layout:
+#   [0] seq_lengths_q, [1] seq_lengths_kv,
+#   [2] kv_num_blocks, [3] kv_indices, [4] full_kv_num_blocks, [5] full_kv_indices,
+#   [6] q_num_blocks,  [7] q_indices,  [8] full_q_num_blocks,  [9] full_q_indices,
+#   [10] KV_BLOCK_SIZE, [11] Q_BLOCK_SIZE, [12] mask_mod
+#
+# Forward needs KV-direction (indices 2-5): for each Q block, which KV blocks to visit.
+# Backward needs Q-direction (indices 6-9): for each KV block, which Q blocks affect it.
 
-# Indices into BlockMask.as_tuple(flatten=True) for Q-direction tensors.
+_BM_KV_NUM_BLOCKS = 2
+_BM_KV_INDICES = 3
+_BM_FULL_KV_NUM_BLOCKS = 4
+_BM_FULL_KV_INDICES = 5
 _BM_Q_NUM_BLOCKS = 6
 _BM_Q_INDICES = 7
 _BM_FULL_Q_NUM_BLOCKS = 8
 _BM_FULL_Q_INDICES = 9
 
+# Level 1: B=1, H=1 raw tensors keyed by (q_len, kv_len, block_size, device_index).
+_block_mask_raw_cache: dict = {}
+# Level 2: expanded BlockSparseTensorsTorch keyed by (q_len, kv_len, bsz, num_heads, direction, block_size, device_index).
+_block_sparse_cache: dict = {}
 
-def _get_bwd_block_sparse(mask_mod_flex, q_len, kv_len, bsz, num_heads, max_seq_len, device):
-    """Return BlockSparseTensorsTorch for SM90 backward, creating and caching as needed.
 
-    On SM90, _flash_attn_bwd with causal=False + mask_mod requires block_sparse_tensors
-    (forces m_block_size=64, dQ_swapAB=False). The EAGLE3 mask is batch/head-independent,
-    so we compute with B=1, H=1 to avoid OOM, then expand to (bsz, num_heads).
+def _fa4_block_size() -> tuple:
+    """Return (Q_BLOCK_SIZE, KV_BLOCK_SIZE) for FA4 block-sparse iteration.
+
+    SM100+ (Blackwell) requires Q_BLOCK_SIZE=256 for both forward and backward
+    due to subtile_factor=2 (q_stage=2, two M-tiles per CTA).
+    SM90 (Hopper) uses 128 x 128.
     """
+    if _cuda_sm_major >= 10:
+        return (256, 128)
+    return (128, 128)
+
+
+def _get_block_sparse(
+    mask_mod_flex,
+    q_len,
+    kv_len,
+    bsz,
+    num_heads,
+    device,
+    direction="kv",
+):
+    """Return BlockSparseTensorsTorch for FA4 forward or backward.
+
+    direction="kv": KV-direction tensors for forward (skip empty KV blocks per Q block).
+    direction="q":  Q-direction tensors for backward (skip empty Q blocks per KV block).
+
+    The EAGLE3 mask is batch/head-independent, so we compute with B=1, H=1
+    and expand to (bsz, num_heads).
+    """
+    block_size = _fa4_block_size()
     device_idx = device.index or 0
 
-    # Level 1: compute block mask once per unique shape.
-    raw_key = (q_len, kv_len, max_seq_len, device_idx)
-    if raw_key not in _bwd_bm_raw_cache:
+    raw_key = (q_len, kv_len, block_size, device_idx)
+    if raw_key not in _block_mask_raw_cache:
         bm = create_block_mask(
             mask_mod_flex,
             B=1,
@@ -913,45 +1021,70 @@ def _get_bwd_block_sparse(mask_mod_flex, q_len, kv_len, bsz, num_heads, max_seq_
             Q_LEN=q_len,
             KV_LEN=kv_len,
             device=device,
-            BLOCK_SIZE=(128, 128),
+            BLOCK_SIZE=block_size,
         )
         t = bm.as_tuple()
-        _bwd_bm_raw_cache[raw_key] = (
-            t[_BM_Q_NUM_BLOCKS],
-            t[_BM_Q_INDICES],
-            t[_BM_FULL_Q_NUM_BLOCKS],
-            t[_BM_FULL_Q_INDICES],
-        )
+        _block_mask_raw_cache[raw_key] = {
+            "kv": (
+                t[_BM_KV_NUM_BLOCKS],
+                t[_BM_KV_INDICES],
+                t[_BM_FULL_KV_NUM_BLOCKS],
+                t[_BM_FULL_KV_INDICES],
+            ),
+            "q": (
+                t[_BM_Q_NUM_BLOCKS],
+                t[_BM_Q_INDICES],
+                t[_BM_FULL_Q_NUM_BLOCKS],
+                t[_BM_FULL_Q_INDICES],
+            ),
+        }
 
-    # Level 2: expand to (bsz, num_heads).
-    cache_key = (q_len, kv_len, bsz, num_heads, max_seq_len, device_idx)
-    if cache_key not in _bwd_block_sparse_cache:
-        q_cnt, q_idx, fq_cnt, fq_idx = _bwd_bm_raw_cache[raw_key]
-        _bwd_block_sparse_cache[cache_key] = BlockSparseTensorsTorch(
-            mask_block_cnt=q_cnt.expand(bsz, num_heads, -1).contiguous(),
-            mask_block_idx=q_idx.expand(bsz, num_heads, -1, -1).contiguous(),
-            full_block_cnt=fq_cnt.expand(bsz, num_heads, -1).contiguous(),
-            full_block_idx=fq_idx.expand(bsz, num_heads, -1, -1).contiguous(),
-            block_size=(128, 128),
+    cache_key = (q_len, kv_len, bsz, num_heads, direction, block_size, device_idx)
+    if cache_key not in _block_sparse_cache:
+        cnt, idx, f_cnt, f_idx = _block_mask_raw_cache[raw_key][direction]
+        _block_sparse_cache[cache_key] = BlockSparseTensorsTorch(
+            mask_block_cnt=cnt.expand(bsz, num_heads, -1).contiguous(),
+            mask_block_idx=idx.expand(bsz, num_heads, -1, -1).contiguous(),
+            full_block_cnt=f_cnt.expand(bsz, num_heads, -1).contiguous()
+            if f_cnt is not None
+            else None,
+            full_block_idx=f_idx.expand(bsz, num_heads, -1, -1).contiguous()
+            if f_idx is not None
+            else None,
+            block_size=block_size,
         )
-    return _bwd_block_sparse_cache[cache_key]
+    return _block_sparse_cache[cache_key]
 
 
 class _EagleMaskedFlashAttnFunc(torch.autograd.Function):
-    """Autograd wrapper for flash_attn fwd/bwd with mask_mod.
+    """Autograd wrapper for flash_attn fwd/bwd with mask_mod + block sparsity.
 
     The public flash_attn_func does not pass mask_mod to its backward, making
     gradients incorrect for non-causal custom masks. This wrapper correctly
     forwards mask_mod to both _flash_attn_fwd and _flash_attn_bwd.
 
-    On SM90, backward with causal=False + mask_mod requires block_sparse_tensors
-    (forces m_block_size=64, dQ_swapAB=False). These are computed once and cached.
+    Block-sparse iteration lets the kernel skip tiles that are entirely masked
+    out, which is critical for the EAGLE3 pattern at long sequences where the
+    mask is very sparse (causal + diagonal suffix).
     """
 
     @staticmethod
     def forward(
         ctx, q, k, v, mask_mod_cute, mask_mod_flex, softmax_scale, max_seq_len, aux_tensors=None
     ):
+        bsz, q_len, num_heads, _ = q.shape
+        kv_len = k.shape[1]
+
+        fwd_block_sparse = _get_block_sparse(
+            mask_mod_flex,
+            q_len,
+            kv_len,
+            bsz,
+            num_heads,
+            q.device,
+            direction="kv",
+        )
+
         out, lse = _flash_attn_fwd(
             q,
             k,
@@ -959,16 +1092,20 @@ class _EagleMaskedFlashAttnFunc(torch.autograd.Function):
             softmax_scale=softmax_scale,
             causal=False,
             mask_mod=mask_mod_cute,
+            block_sparse_tensors=fwd_block_sparse,
             return_lse=True,
             aux_tensors=aux_tensors,
         )
 
-        bwd_block_sparse = None
-        if _cuda_sm_major == 9:
-            bsz, q_len, num_heads, _ = q.shape
-            bwd_block_sparse = _get_bwd_block_sparse(
-                mask_mod_flex, q_len, k.shape[1], bsz, num_heads, max_seq_len, q.device
-            )
+        bwd_block_sparse = _get_block_sparse(
+            mask_mod_flex,
+            q_len,
+            kv_len,
+            bsz,
+            num_heads,
+            q.device,
+            direction="q",
+        )
 
         ctx.save_for_backward(q, k, v, out, lse)
         ctx.softmax_scale = softmax_scale
@@ -1040,7 +1177,13 @@ class LlamaAttention(nn.Module):
             scaling_type = rope_get("rope_type", rope_get("type"))
             scaling_factor = rope_get("factor")
 
-            if scaling_type == "linear":
+            if scaling_type in (None, "default"):
+                self.rotary_emb = LlamaRotaryEmbedding(
+                    self.head_dim,
+                    max_position_embeddings=self.max_position_embeddings,
+                    base=rope_get("rope_theta", getattr(self.config, "rope_theta", 10000)),
+                )
+            elif scaling_type == "linear":
                 if scaling_factor is None:
                     raise ValueError(
                         "Linear RoPE scaling requires 'factor' in rope_scaling config."
@@ -1086,14 +1229,6 @@ class LlamaAttention(nn.Module):
                     beta_slow=rope_get("beta_slow"),
                     mscale=rope_get("mscale"),
                     mscale_all_dim=rope_get("mscale_all_dim"),
-                )
-            elif scaling_type == "default":
-                # HuggingFace normalizes rope_scaling=None into {"rope_type": "default"}.
-                # Treat as no scaling.
-                self.rotary_emb = LlamaRotaryEmbedding(
-                    self.head_dim,
-                    max_position_embeddings=self.max_position_embeddings,
-                    base=rope_get("rope_theta", getattr(self.config, "rope_theta", 10000)),
                 )
             else:
                 raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
@@ -1331,6 +1466,17 @@ class LlamaFlashAttention(LlamaAttention):
         - cache_keys/cache_values: tensor caches for storing past key and value states
     """
 
+    def __init__(self, config):
+        super().__init__(config)
+        if (
+            _std_flash_attn_forward is None
+            or _std_flash_attn_backward is None
+            or _std_flash_unpad_input is None
+            or _std_flash_pad_input is None
+            or _std_flash_attn_varlen_backward is None
+        ):
+            _raise_standard_flash_attn_unavailable()
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1346,12 +1492,10 @@ class LlamaFlashAttention(LlamaAttention):
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
 
-        # FA uses [bsz, seq_len, heads, head_dim] layout
         query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim)
         key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim)
         value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim)
 
-        # cache_keys shape: [bsz, num_cached, seq_len, num_kv_heads, head_dim]
         lck = 0 if cache_keys is None else cache_keys.shape[1]
         if isinstance(self.rotary_emb, LlamaMutiRotaryEmbedding):
             cos, sin = self.rotary_emb(query_states, position_ids + lck)
@@ -1371,7 +1515,6 @@ class LlamaFlashAttention(LlamaAttention):
                 query_states, key_states, cos, sin, position_ids + lck, unsqueeze_dim=2
             )
 
-        # Append to tensor cache: [bsz, num_cached, seq_len, num_kv_heads, head_dim]
         if cache_keys is not None:
             cache_keys = torch.cat([cache_keys, key_states.unsqueeze(1)], dim=1)
             cache_values = torch.cat([cache_values, value_states.unsqueeze(1)], dim=1)
@@ -1379,53 +1522,20 @@ class LlamaFlashAttention(LlamaAttention):
             cache_keys = key_states.unsqueeze(1)
             cache_values = value_states.unsqueeze(1)
 
-        k0 = cache_keys[:, 0]
-        v0 = cache_values[:, 0]
+        assert attention_mask is not None, "LlamaFlashAttention cached path requires attention_mask"
+        valid_lengths = attention_mask.sum(dim=-1, dtype=torch.long) - lck
+        valid_lengths = valid_lengths.clamp_(0, q_len)
 
-        assert _flash_attn_func is not None, (
-            f"flash_attn.cute is unavailable. ImportError: {_flash_attn_import_error!r}"
-        )
-        attn_output, lse = _flash_attn_func(
+        attn_output = _FlashCachedMergeFunc.apply(
             query_states,
-            k0,
-            v0,
-            softmax_scale=1.0 / math.sqrt(self.head_dim),
-            causal=True,
+            cache_keys,
+            cache_values,
+            valid_lengths,
+            1.0 / math.sqrt(self.head_dim),
         )
-        lse = lse.transpose(1, 2)
-
-        lck = cache_keys.shape[1]
-        if lck > 1:
-            q_shape_expanded = (
-                bsz,
-                q_len,
-                self.num_key_value_heads,
-                self.num_key_value_groups,
-                self.head_dim,
-            )
-            attn_outputs = [attn_output.view(q_shape_expanded)]
-            lses = [lse.view(q_shape_expanded[:-1])]
-
-            for i in range(1, lck):
-                ki = cache_keys[:, i].unsqueeze(-2)
-                qi = query_states.view(q_shape_expanded)
-                vi = cache_values[:, i].unsqueeze(-2)
-
-                attn_outputs.append(vi)
-                lses.append((qi * ki).sum(-1) / math.sqrt(self.head_dim))
-
-            lse = torch.logsumexp(torch.stack(lses, dim=-1), dim=-1)
-            attn_output = sum(
-                attn_outputi * torch.exp(lsei - lse).unsqueeze(-1)
-                for attn_outputi, lsei in zip(attn_outputs, lses)
-            )
-            # lse is fp32, downcast attn_output back
-            attn_output = attn_output.to(self.o_proj.weight.dtype)
 
         attn_output = attn_output.reshape(bsz, q_len, self.head_dim * self.num_heads)
-
         attn_output = self.o_proj(attn_output)
-
         return attn_output, cache_keys, cache_values
 
 
@@ -1549,6 +1659,261 @@ class LlamaFlashAttentionMasked(LlamaAttention):
         if pad_sz > 0:
             attn_output = attn_output[:, :orig_q_len, :]
         return attn_output, cache_keys, cache_values
+
+
+def _standard_flash_attn_forward(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    softmax_scale: float,
+    causal: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    out, lse, _, _ = _std_flash_attn_forward(
+        q,
+        k,
+        v,
+        dropout_p=0.0,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        window_size_left=-1,
+        window_size_right=-1,
+        softcap=0.0,
+        alibi_slopes=None,
+        return_softmax=False,
+    )
+    return out, lse
+
+
+def _standard_flash_attn_backward_call(
+    dout: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    softmax_lse: torch.Tensor,
+    dq: torch.Tensor,
+    dk: torch.Tensor,
+    dv: torch.Tensor,
+    softmax_scale: float,
+    causal: bool,
+) -> None:
+    _std_flash_attn_backward(
+        dout,
+        q,
+        k,
+        v,
+        out,
+        softmax_lse,
+        dq,
+        dk,
+        dv,
+        0.0,
+        softmax_scale,
+        causal,
+        -1,
+        -1,
+        0.0,
+        None,
+        False,
+        None,
+    )
+
+
+def _standard_flash_attn_varlen_forward(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    attention_mask: torch.Tensor,
+    softmax_scale: float,
+    causal: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    q_unpad, indices_q, cu_seqlens_q, max_seqlen_q, _ = _std_flash_unpad_input(q, attention_mask)
+    k_unpad, _, cu_seqlens_k, max_seqlen_k, _ = _std_flash_unpad_input(k, attention_mask)
+    v_unpad, _, _, _, _ = _std_flash_unpad_input(v, attention_mask)
+    out_unpad, lse_unpad, _ = _std_flash_attn_varlen_func(
+        q_unpad,
+        k_unpad,
+        v_unpad,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        dropout_p=0.0,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        return_attn_probs=True,
+    )
+    out = _std_flash_pad_input(out_unpad, indices_q, q.shape[0], q.shape[1])
+    lse_padded = _std_flash_pad_input(
+        lse_unpad.transpose(0, 1), indices_q, q.shape[0], q.shape[1]
+    ).transpose(1, 2)
+    return out, lse_padded, indices_q, cu_seqlens_q
+
+
+def _standard_flash_attn_varlen_backward_call(
+    dout: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    softmax_lse: torch.Tensor,
+    attention_mask: torch.Tensor,
+    dq: torch.Tensor,
+    dk: torch.Tensor,
+    dv: torch.Tensor,
+    softmax_scale: float,
+    causal: bool,
+) -> None:
+    q_unpad, indices_q, cu_seqlens_q, max_seqlen_q, _ = _std_flash_unpad_input(q, attention_mask)
+    k_unpad, indices_k, cu_seqlens_k, max_seqlen_k, _ = _std_flash_unpad_input(k, attention_mask)
+    v_unpad, _, _, _, _ = _std_flash_unpad_input(v, attention_mask)
+    dout_unpad, _, _, _, _ = _std_flash_unpad_input(dout, attention_mask)
+    out_unpad, _, _, _, _ = _std_flash_unpad_input(out, attention_mask)
+    lse_unpad, _, _, _, _ = _std_flash_unpad_input(softmax_lse.transpose(1, 2), attention_mask)
+    lse_unpad = lse_unpad.transpose(0, 1).contiguous()
+
+    dq_unpad = torch.empty_like(q_unpad)
+    dk_unpad = torch.empty_like(k_unpad)
+    dv_unpad = torch.empty_like(v_unpad)
+    _std_flash_attn_varlen_backward(
+        dout_unpad,
+        q_unpad,
+        k_unpad,
+        v_unpad,
+        out_unpad,
+        lse_unpad,
+        dq_unpad,
+        dk_unpad,
+        dv_unpad,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        0.0,
+        softmax_scale,
+        causal,
+        -1,
+        -1,
+        0.0,
+        None,
+        False,
+        None,
+    )
+    dq.copy_(_std_flash_pad_input(dq_unpad, indices_q, q.shape[0], q.shape[1]))
+    dk.copy_(_std_flash_pad_input(dk_unpad, indices_k, k.shape[0], k.shape[1]))
+    dv.copy_(_std_flash_pad_input(dv_unpad, indices_k, v.shape[0], v.shape[1]))
+
+
+class _FlashCachedMergeFunc(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, q, cache_k, cache_v, valid_lengths, softmax_scale: float):
+        bsz, q_len, num_heads, head_dim = q.shape
+        num_blocks = cache_k.shape[1]
+        num_kv_heads = cache_k.shape[3]
+        num_groups = num_heads // num_kv_heads
+        q_expanded = q.view(bsz, q_len, num_kv_heads, num_groups, head_dim)
+        valid_lengths = valid_lengths.to(device=q.device, dtype=torch.long).clamp_(0, q_len)
+        valid_mask = (
+            torch.arange(q_len, device=q.device).unsqueeze(0) < valid_lengths.unsqueeze(1)
+        ).view(bsz, q_len, 1, 1)
+        attention_mask = valid_mask.view(bsz, q_len)
+
+        k0 = cache_k[:, 0].contiguous()
+        v0 = cache_v[:, 0].contiguous()
+        out0, lse0_kernel, _, _ = _standard_flash_attn_varlen_forward(
+            q.contiguous(),
+            k0,
+            v0,
+            attention_mask,
+            softmax_scale=softmax_scale,
+            causal=True,
+        )
+        out0_expanded = out0.view(bsz, q_len, num_kv_heads, num_groups, head_dim).float()
+        neg_inf = torch.tensor(float("-inf"), device=q.device, dtype=torch.float32)
+        lse0 = lse0_kernel.transpose(1, 2).view(bsz, q_len, num_kv_heads, num_groups).float()
+        lse0 = torch.where(valid_mask, lse0, neg_inf)
+        lse_terms = [lse0]
+        attn_terms = [out0_expanded]
+        for i in range(1, num_blocks):
+            ki = cache_k[:, i].unsqueeze(-2).float()
+            vi = cache_v[:, i].unsqueeze(-2).float()
+            lse_i = (q_expanded.float() * ki).sum(-1) * softmax_scale
+            lse_terms.append(torch.where(valid_mask, lse_i, neg_inf))
+            attn_terms.append(vi.expand_as(out0_expanded))
+
+        merged_lse = torch.logsumexp(torch.stack(lse_terms, dim=-1), dim=-1)
+        out = sum(
+            term * torch.exp(lse - merged_lse).unsqueeze(-1)
+            for term, lse in zip(attn_terms, lse_terms)
+        )
+        out = torch.where(valid_mask.unsqueeze(-1), out, 0.0)
+        merged_lse = torch.where(valid_mask, merged_lse, 0.0)
+        ctx.save_for_backward(q, cache_k, cache_v, out, merged_lse, valid_lengths)
+        ctx.softmax_scale = softmax_scale
+        return out.to(q.dtype).reshape_as(q)
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        q, cache_k, cache_v, out, merged_lse, valid_lengths = ctx.saved_tensors
+        bsz, q_len, num_heads, head_dim = q.shape
+        num_blocks = cache_k.shape[1]
+        num_kv_heads = cache_k.shape[3]
+        num_groups = num_heads // num_kv_heads
+        scale = ctx.softmax_scale
+        if grad_out.ndim == 3:
+            grad_out = grad_out.view(bsz, q_len, num_heads, head_dim)
+        valid_lengths = valid_lengths.to(device=q.device, dtype=torch.long)
+        valid_mask = (
+            torch.arange(q_len, device=q.device).unsqueeze(0) < valid_lengths.unsqueeze(1)
+        ).view(bsz, q_len, 1, 1)
+        attention_mask = valid_mask.view(bsz, q_len)
+        grad_out = torch.where(valid_mask, grad_out, 0.0)
+
+        grad_out_f = grad_out.float().view(bsz, q_len, num_kv_heads, num_groups, head_dim)
+        q_f = q.float()
+        q_expanded = q_f.view(bsz, q_len, num_kv_heads, num_groups, head_dim)
+        out_f = out.float()
+        out_expanded = out_f.view(bsz, q_len, num_kv_heads, num_groups, head_dim)
+        out_q = out.to(q.dtype).reshape(bsz, q_len, num_heads, head_dim)
+
+        dq = torch.zeros_like(q_f)
+        dcache_k = torch.zeros_like(cache_k.float())
+        dcache_v = torch.zeros_like(cache_v.float())
+
+        dq0 = torch.zeros_like(q)
+        dk0 = torch.zeros_like(cache_k[:, 0])
+        dv0 = torch.zeros_like(cache_v[:, 0])
+        merged_lse_kernel = merged_lse.reshape(bsz, q_len, num_heads).transpose(1, 2).contiguous()
+        _standard_flash_attn_varlen_backward_call(
+            grad_out.contiguous(),
+            q.contiguous(),
+            cache_k[:, 0].contiguous(),
+            cache_v[:, 0].contiguous(),
+            out_q.contiguous(),
+            merged_lse_kernel,
+            attention_mask,
+            dq0,
+            dk0,
+            dv0,
+            softmax_scale=scale,
+            causal=True,
+        )
+        dq += dq0.float()
+        dcache_k[:, 0] += dk0.float()
+        dcache_v[:, 0] += dv0.float()
+
+        for i in range(1, num_blocks):
+            ki = cache_k[:, i].float().unsqueeze(-2)
+            vi = cache_v[:, i].float().unsqueeze(-2)
+            lse_i = (q_expanded * ki).sum(-1) * scale
+            wi = torch.where(valid_mask, torch.exp(lse_i - merged_lse), 0.0)
+            d_out_i = grad_out_f * wi.unsqueeze(-1)
+            d_lse_i = wi * (grad_out_f * (vi.expand_as(out_expanded) - out_expanded)).sum(-1)
+            dq += (d_lse_i.unsqueeze(-1) * scale * ki).reshape_as(q)
+            dcache_k[:, i] += (d_lse_i.unsqueeze(-1) * scale * q_expanded).sum(dim=3)
+            dcache_v[:, i] += d_out_i.sum(dim=3)
+
+        return dq.to(q.dtype), dcache_k.to(cache_k.dtype), dcache_v.to(cache_v.dtype), None, None
 
 
 def warmup_flash_attention_masked(
@@ -1688,22 +2053,14 @@ class LlamaRMSNorm(nn.Module):
 
 
 class LlamaDecoderLayer(nn.Module):
-    def __init__(self, config, attention_backend: str = "sdpa"):
+    def __init__(self, config, attention_backend: str = "flex_attention"):
         super().__init__()
         self.hidden_size = config.hidden_size
 
-        if attention_backend == "sdpa":
-            self.self_attn = LlamaAttention(config=config)
-        elif attention_backend == "flex_attention":
+        if attention_backend == "flex_attention":
             print_with_rank("Using flex attention on draft model training!")
             self.self_attn = LlamaFlexAttention(config=config)
-        elif attention_backend == "fa":
-            self.self_attn = LlamaFlashAttention(config=config)
-        elif attention_backend == "fa_experimental":
-            print_with_rank(
-                "[EXPERIMENTAL] Using LlamaFlashAttentionMasked (flash-attention cute DSL). "
-                "Validated on SM80/SM90/SM100."
-            )
+        elif attention_backend == "fa4":
             self.self_attn = LlamaFlashAttentionMasked(config=config)
         else:
             raise ValueError(f"Unknown attention backend {attention_backend}")
@@ -1753,7 +2110,7 @@ class LlamaDecoderLayer(nn.Module):
 class LlamaForCausalLMEagle3(Eagle3DraftModel):
     config_class = LlamaConfig
 
-    def __init__(self, config, attention_backend="sdpa") -> None:
+    def __init__(self, config, attention_backend="flex_attention") -> None:
         super().__init__(config)
         self.config = config
 

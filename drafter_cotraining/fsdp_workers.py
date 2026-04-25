@@ -22,6 +22,7 @@ import torch
 from omegaconf import DictConfig
 
 from verl.protocol import DataProto
+from verl.single_controller.base import Worker
 from verl.single_controller.base.decorator import Dispatch, make_nd_compute_dataproto_dispatch_fn, register
 from verl.workers.engine_workers import ActorRolloutRefWorker
 
@@ -183,19 +184,77 @@ class ActorRolloutRefDrafterWorker(ActorRolloutRefWorker):
             return DataProto(non_tensor_batch={})
 
         mooncake_keys = data.non_tensor_batch.get("mooncake_keys", [])
-        shapes_list = data.non_tensor_batch.get("shapes", [])
-        dtypes_list = data.non_tensor_batch.get("dtypes", [])
-        prompt_lens = data.non_tensor_batch.get("prompt_lens", [])
-        response_lens = data.non_tensor_batch.get("response_lens", [])
         if len(mooncake_keys) == 0:
             return DataProto(non_tensor_batch={})
 
         import torch.distributed as dist
         rank = dist.get_rank() if dist.is_initialized() else 0
 
+        batch = self._fetch_drafter_batch_from_mooncake(data, rank)
+        if batch is None:
+            return DataProto(non_tensor_batch=data.non_tensor_batch)
+
+        if self.drafter is None:
+            # Smoke-only fallback: no drafter engine configured, so just log
+            # padded shapes per rank and exit. Keeps test_drafter_rollout_hs.py
+            # runnable without a real Eagle3 checkpoint.
+            self._log_drafter_batch_shapes(batch, rank)
+            return DataProto(non_tensor_batch=data.non_tensor_batch)
+
+        metrics = self._drafter_train_step(batch, rank)
+
+        # Also log shapes the first time through so the smoke output still
+        # contains the padded-shape sanity line.
+        if not getattr(self, "_drafter_shapes_logged", False):
+            self._log_drafter_batch_shapes(batch, rank)
+            self._drafter_shapes_logged = True
+
+        return DataProto(
+            non_tensor_batch=data.non_tensor_batch,
+            meta_info={"train_metrics": metrics},
+        )
+
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="drafter"))
+    def evaluate_drafter(self, data: DataProto):
+        """Receive Mooncake keys, fetch tensors, and report drafter eval metrics.
+
+        This mirrors update_drafter's fetch/collate path but runs the Eagle3
+        forward under no_grad and never steps the optimizer.
+        """
+        if len(data) == 0:
+            return DataProto(non_tensor_batch={})
+
+        mooncake_keys = data.non_tensor_batch.get("mooncake_keys", [])
+        if len(mooncake_keys) == 0:
+            return DataProto(non_tensor_batch={})
+
+        import torch.distributed as dist
+        rank = dist.get_rank() if dist.is_initialized() else 0
+
+        batch = self._fetch_drafter_batch_from_mooncake(data, rank)
+        if batch is None:
+            return DataProto(non_tensor_batch=data.non_tensor_batch)
+
+        if self.drafter is None:
+            self._log_drafter_batch_shapes(batch, rank)
+            return DataProto(non_tensor_batch=data.non_tensor_batch)
+
+        metrics = self._drafter_eval_step(batch, rank)
+        return DataProto(
+            non_tensor_batch=data.non_tensor_batch,
+            meta_info={"eval_metrics": metrics},
+        )
+
+    def _fetch_drafter_batch_from_mooncake(self, data: DataProto, rank: int):
+        mooncake_keys = data.non_tensor_batch.get("mooncake_keys", [])
+        shapes_list = data.non_tensor_batch.get("shapes", [])
+        dtypes_list = data.non_tensor_batch.get("dtypes", [])
+        prompt_lens = data.non_tensor_batch.get("prompt_lens", [])
+        response_lens = data.non_tensor_batch.get("response_lens", [])
+
         store = self._get_mooncake_store(data.meta_info.get("mooncake_cfg", {}), rank)
         if store is None:
-            return DataProto(non_tensor_batch=data.non_tensor_batch)
+            return None
 
         device = torch.device("cuda", torch.cuda.current_device())
 
@@ -249,27 +308,7 @@ class ActorRolloutRefDrafterWorker(ActorRolloutRefWorker):
                 has_last_hidden_states=out.last_hidden_states is not None,
             )
 
-        batch = collator(features)
-
-        if self.drafter is None:
-            # Smoke-only fallback: no drafter engine configured, so just log
-            # padded shapes per rank and exit. Keeps test_drafter_rollout_hs.py
-            # runnable without a real Eagle3 checkpoint.
-            self._log_drafter_batch_shapes(batch, rank)
-            return DataProto(non_tensor_batch=data.non_tensor_batch)
-
-        metrics = self._drafter_train_step(batch, rank)
-
-        # Also log shapes the first time through so the smoke output still
-        # contains the padded-shape sanity line.
-        if not getattr(self, "_drafter_shapes_logged", False):
-            self._log_drafter_batch_shapes(batch, rank)
-            self._drafter_shapes_logged = True
-
-        return DataProto(
-            non_tensor_batch=data.non_tensor_batch,
-            meta_info={"train_metrics": metrics},
-        )
+        return collator(features)
 
     def _log_drafter_batch_shapes(self, batch, rank: int):
         lhs_shape = (
@@ -325,10 +364,35 @@ class ActorRolloutRefDrafterWorker(ActorRolloutRefWorker):
             grad_norm=grad_norm,
             lr=lr,
             rank=rank,
+            prefix="train",
+        )
+
+    def _drafter_eval_step(self, batch, rank: int) -> dict:
+        """Eagle3 forward for evaluation only; no backward or optimizer step."""
+        engine = self.drafter.engine
+        device = torch.device("cuda", torch.cuda.current_device())
+
+        batch_dev = {
+            k: (v.to(device) if torch.is_tensor(v) else v) for k, v in batch.items()
+        }
+
+        with engine.eval_mode(), torch.no_grad():
+            prepared = engine.prepare_model_inputs(batch_dev)
+            plosses, _, acces = engine.module(**prepared)
+
+        loss_weights = [0.8 ** i for i in range(len(plosses))]
+        return self._aggregate_drafter_metrics(
+            plosses=plosses,
+            acces=acces,
+            loss_weights=loss_weights,
+            grad_norm=None,
+            lr=None,
+            rank=rank,
+            prefix="val",
         )
 
     def _aggregate_drafter_metrics(
-        self, plosses, acces, loss_weights, grad_norm, lr, rank: int
+        self, plosses, acces, loss_weights, grad_norm, lr, rank: int, prefix: str = "train"
     ) -> dict:
         """All-reduce per-TTT-step plosses/acces across DP and build metrics dict."""
         import torch.distributed as dist
@@ -356,25 +420,27 @@ class ActorRolloutRefDrafterWorker(ActorRolloutRefWorker):
         avg_acc = sum(acces_list) / max(len(acces_list), 1)
 
         metrics = {
-            "train/loss_weighted": float(weighted_loss),
-            "train/loss_raw_mean": float(raw_mean_loss),
-            "train/avg_acc": float(avg_acc),
-            "train/simulated_acc_len": float(simulated_acc_len),
-            "train/grad_norm": float(grad_norm) if grad_norm is not None else 0.0,
-            "train/lr": float(lr) if lr is not None else 0.0,
+            f"{prefix}/loss_weighted": float(weighted_loss),
+            f"{prefix}/loss_raw_mean": float(raw_mean_loss),
+            f"{prefix}/avg_acc": float(avg_acc),
+            f"{prefix}/simulated_acc_len": float(simulated_acc_len),
         }
+        if grad_norm is not None:
+            metrics[f"{prefix}/grad_norm"] = float(grad_norm)
+        if lr is not None:
+            metrics[f"{prefix}/lr"] = float(lr)
         for i, p in enumerate(plosses_list):
-            metrics[f"train/ploss_{i}"] = float(p)
+            metrics[f"{prefix}/ploss_{i}"] = float(p)
         for i, a in enumerate(acces_list):
-            metrics[f"train/acc_{i}"] = float(a)
+            metrics[f"{prefix}/acc_{i}"] = float(a)
 
         if rank == 0:
             print(
-                f"[drafter] loss={metrics['train/loss_weighted']:.4f} "
-                f"acc0={metrics['train/acc_0']:.4f} "
-                f"acc_len={metrics['train/simulated_acc_len']:.2f} "
-                f"grad={metrics['train/grad_norm']:.3f} "
-                f"lr={metrics['train/lr']:.2e}"
+                f"[drafter {prefix}] loss={metrics[f'{prefix}/loss_weighted']:.4f} "
+                f"acc0={metrics[f'{prefix}/acc_0']:.4f} "
+                f"acc_len={metrics[f'{prefix}/simulated_acc_len']:.2f} "
+                f"grad={metrics.get(f'{prefix}/grad_norm', 0.0):.3f} "
+                f"lr={metrics.get(f'{prefix}/lr', 0.0):.2e}"
             )
 
         return metrics
@@ -510,3 +576,76 @@ class ActorRolloutRefDrafterWorker(ActorRolloutRefWorker):
             # Drafter → rollout (for speculative decoding at inference time)
             drafter_params, _ = self.drafter.engine.get_per_tensor_param()
             await self.rollout.update_drafter_weights(drafter_params)
+
+
+class DrafterPretrainWorker(Worker):
+    """Drafter-only worker for standalone pretraining.
+
+    No actor, ref, rollout, or PPO micro-batch config is required. The decorated
+    drafter methods are reused from ActorRolloutRefDrafterWorker so the mesh
+    dispatch contract stays identical without inheriting actor/rollout state.
+    """
+
+    _init_drafter = ActorRolloutRefDrafterWorker._init_drafter
+    update_drafter = ActorRolloutRefDrafterWorker.update_drafter
+    evaluate_drafter = ActorRolloutRefDrafterWorker.evaluate_drafter
+    _fetch_drafter_batch_from_mooncake = ActorRolloutRefDrafterWorker._fetch_drafter_batch_from_mooncake
+    _log_drafter_batch_shapes = ActorRolloutRefDrafterWorker._log_drafter_batch_shapes
+    _drafter_train_step = ActorRolloutRefDrafterWorker._drafter_train_step
+    _drafter_eval_step = ActorRolloutRefDrafterWorker._drafter_eval_step
+    _aggregate_drafter_metrics = ActorRolloutRefDrafterWorker._aggregate_drafter_metrics
+    _get_mooncake_store = ActorRolloutRefDrafterWorker._get_mooncake_store
+    save_drafter_checkpoint = ActorRolloutRefDrafterWorker.save_drafter_checkpoint
+
+    def __init__(self, config: DictConfig, role: str = "drafter", **kwargs):
+        del role, kwargs
+        Worker.__init__(self)
+        self.config = config
+        self.role = "drafter"
+        self.actor = None
+        self.ref = None
+        self.rollout = None
+        self.drafter = None
+        self._drafter_enabled = (config.get("drafter", {}) or {}).get("enable", False)
+        self._mooncake_store = None
+
+    def _sync_drafter_frozen_modules(self):
+        return
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def init_model(self):
+        if not self._drafter_enabled:
+            raise ValueError("actor_rollout_ref.drafter.enable must be True for pretraining")
+
+        drafter_cfg = self.config.get("drafter", {}) or {}
+        model_cfg = drafter_cfg.get("model_config", {}) or {}
+        if not model_cfg.get("target_model_path"):
+            raise ValueError(
+                "actor_rollout_ref.drafter.model_config.target_model_path must be set "
+                "for drafter pretraining"
+            )
+
+        self._init_drafter()
+
+        import torch.distributed as dist
+
+        self._register_dispatch_collect_info(
+            mesh_name="drafter",
+            dp_rank=dist.get_rank(),
+            is_collect=True,
+        )
+        logger.info("Drafter pretrain worker initialized")
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def to(self, device, model=True, optimizer=True, grad=True):
+        if self.drafter is None:
+            return
+        self.drafter.to(device=device, model=model, optimizer=optimizer, grad=grad)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def sleep(self):
+        self.to("cpu", model=True, optimizer=True, grad=True)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def wake_up(self):
+        self.to("device", model=True, optimizer=True, grad=True)

@@ -61,7 +61,7 @@ def _make_config(H=128, V=256, draft_V=None, num_heads=4, num_kv_heads=2):
     return config
 
 
-def _make_model(config, length=3, attention_backend="sdpa", device="cpu"):
+def _make_model(config, length=3, attention_backend="flex_attention", device="cpu"):
     draft_model = LlamaForCausalLMEagle3(config, attention_backend=attention_backend)
     draft_model = draft_model.to(device=device, dtype=torch.bfloat16)
     model = Eagle3Model(
@@ -328,7 +328,7 @@ class TestRotaryConfigWiring(unittest.TestCase):
         )
         config.draft_vocab_size = 256
 
-        model = LlamaForCausalLMEagle3(config, attention_backend="sdpa")
+        model = LlamaForCausalLMEagle3(config, attention_backend="flex_attention")
         rotary = model.midlayer.self_attn.rotary_emb
 
         self.assertEqual(rotary.base, 50000.0)

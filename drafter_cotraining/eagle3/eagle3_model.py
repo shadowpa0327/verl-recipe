@@ -66,7 +66,7 @@ class Eagle3Model(nn.Module):
         self,
         draft_model,
         length: int = 7,
-        attention_backend="sdpa",
+        attention_backend="flex_attention",
         gradient_checkpointing: bool = False,
     ):
         super().__init__()

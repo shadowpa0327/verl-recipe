@@ -1,0 +1,347 @@
+# Format checks enforced on CI:
+# 1. Comments must appear above each field.
+# 2. There must be a blank line between each field.
+# 3. Inline comments (after a field on the same line) are not allowed.
+# 4. Indentation level is respected for nested fields.
+
+hydra:
+
+  # Reuse the shared verl trainer defaults while keeping this recipe-local.
+  searchpath:
+
+    - file://verl/trainer/config
+
+defaults:
+
+  - ppo_trainer
+
+  - _self_
+
+# Drafter-pretrain controls.
+pretrain:
+
+  # Start a local mooncake_master Ray actor before launching the trainer.
+  launch_master: True
+
+  # Console print frequency for train metrics.
+  log_every: 1
+
+  # Maximum validation batches per eval pass. Set -1 to evaluate all val batches.
+  val_max_batches: -1
+
+  # Save a final drafter checkpoint at the last completed step.
+  save_final: True
+
+# Drafter pretrain data. Parquet files contain explicit prompt/response columns.
+data:
+
+  # Training parquet emitted by scripts/data_preprocess/qwen3_8b_eagle3.py.
+  train_files: ~/data/qwen3_8b_eagle3/train.parquet
+
+  # Evaluation parquet emitted by scripts/data_preprocess/qwen3_8b_eagle3.py.
+  eval_files: ~/data/qwen3_8b_eagle3/test.parquet
+
+  # The field containing prompt messages before the target response.
+  prompt_messages_key: prompt_messages
+
+  # The field containing the target assistant response text.
+  response_key: response
+
+  # Trust Qwen tokenizer/processor remote code by default for this pretrain dataset.
+  trust_remote_code: True
+
+  # Keep dataloader collation in-process because the collator owns a tokenizer.
+  dataloader_num_workers: 0
+
+  # Drafter pretrain batch size.
+  train_batch_size: 8
+
+  # Prompt window used by the DataProto builder.
+  max_prompt_length: 512
+
+  # Response window used by the DataProto builder.
+  max_response_length: 512
+
+  # Extra tokenizer.apply_chat_template kwargs.
+  apply_chat_template_kwargs: {}
+
+  # Shuffle rows each epoch.
+  shuffle: True
+
+# Mooncake connection info shared by HS producer and drafter reader.
+mooncake:
+
+  # Mooncake master server address.
+  master_server_address: localhost:50051
+
+  # Mooncake metadata server URL.
+  metadata_server: http://localhost:8090/metadata
+
+  # Local host name used by Mooncake.
+  local_hostname: localhost
+
+  # Mooncake transfer protocol.
+  protocol: tcp
+
+  # KV lease TTL in seconds.
+  kv_lease_ttl_s: 30.0
+
+# Hidden-states collector. It consumes prompt+response as prefill and writes
+# EAGLE hidden states to Mooncake.
+hs_collector:
+
+  # Target dataclass for config hydration.
+  _target_: recipe.drafter_cotraining.hs_collector.HSCollectorConfig
+
+  # Enable HS collection.
+  enabled: True
+
+  # HF model path for the collector.
+  model_path: ${actor_rollout_ref.model.path}
+
+  # Standalone-only fallback GPU count.
+  n_gpus_per_node: ${trainer.n_gpus_per_node}
+
+  # Standalone-only fallback node count.
+  nnodes: ${trainer.nnodes}
+
+  # vLLM inference settings.
+  inference:
+
+    # Rollout backend.
+    name: vllm
+
+    # Async vLLM server mode.
+    mode: async
+
+    # Tensor parallel size.
+    tensor_model_parallel_size: 1
+
+    # Data parallel size.
+    data_parallel_size: 1
+
+    # Pipeline parallel size.
+    pipeline_model_parallel_size: 1
+
+    # Must be greater than max_prompt_length + max_response_length.
+    max_model_len: 1056
+
+    # vLLM memory fraction for the collector.
+    gpu_memory_utilization: 0.3
+
+    # Collector dtype.
+    dtype: bfloat16
+
+    # Force eager execution.
+    enforce_eager: True
+
+    # Disable chunked prefill for hidden-state extraction.
+    enable_chunked_prefill: False
+
+    # Disable prefix caching so the connector save path always runs.
+    enable_prefix_caching: False
+
+    # vLLM engine kwargs.
+    engine_kwargs:
+
+      # vLLM-specific kwargs.
+      vllm:
+
+        # Trust remote model code.
+        trust_remote_code: True
+
+        # Colocated multi-process executor.
+        distributed_executor_backend: mp
+
+        # Match verl's colocated teacher path.
+        disable_custom_all_reduce: True
+
+        # Mooncake hidden-state connector config.
+        kv_transfer_config:
+
+          # Connector class name.
+          kv_connector: MooncakeHiddenStatesConnector
+
+          # Connector module path.
+          kv_connector_module_path: recipe.drafter_cotraining.mooncake.hidden_states_connector
+
+          # Producer role.
+          kv_role: kv_producer
+
+          # Shared Mooncake settings.
+          kv_connector_extra_config: ${mooncake}
+
+        # vLLM hidden-state extraction hook.
+        speculative_config:
+
+          # Hidden-state extraction method.
+          method: extract_hidden_states
+
+          # Minimal speculative token count.
+          num_speculative_tokens: 1
+
+          # Per-model EAGLE aux layer ids. Override this on the CLI.
+          draft_model_config:
+
+            # HF config overlay for hidden-state extraction.
+            hf_config:
+
+              # Qwen3-8B has 36 hidden layers; [1, n/2-1, n-4, n-1].
+              eagle_aux_hidden_state_layer_ids: [1, 17, 32, 35]
+
+# Drafter training lives under actor_rollout_ref because
+# ActorRolloutRefDrafterWorker receives this subconfig.
+actor_rollout_ref:
+
+  # Target/verifier model for the Qwen3-8B EAGLE3 pretrain dataset.
+  model:
+
+    # Override with a local snapshot path when needed.
+    path: Qwen/Qwen3-8B
+
+    # Trust Qwen model code where needed by HF/vLLM.
+    trust_remote_code: True
+
+  # Rollout is initialized by ActorRolloutRefWorker but unused by this trainer.
+  rollout:
+
+    # Use vLLM so the worker config is fully resolved out of the box.
+    name: vllm
+
+    # Async rollout mode is the supported mode in current verl.
+    mode: async
+
+    # Keep rollout TP at 1 for the default pretrain shape.
+    tensor_model_parallel_size: 1
+
+    # Keep one generated sequence, though generation is unused here.
+    n: 1
+
+    # Match the default HS collector sequence budget.
+    max_model_len: 1056
+
+    # Avoid chunked prefill for hidden-state collection.
+    enable_chunked_prefill: False
+
+    # Avoid prefix cache interactions.
+    enable_prefix_caching: False
+
+  # Drafter settings.
+  drafter:
+
+    # Enable draft-model training.
+    enable: True
+
+    # Optional TrainingWorker loss hook. update_drafter computes the EAGLE loss directly.
+    loss_fn: null
+
+    # Draft model config.
+    model_config:
+
+      # Optional draft config template overlay.
+      local_path: null
+
+      # Draft model dtype.
+      dtype: bfloat16
+
+      # EAGLE training-time token tree length.
+      ttt_length: 7
+
+      # Draft attention backend: flex_attention or fa4.
+      attention_backend: flex_attention
+
+      # Target verifier model path.
+      target_model_path: ${actor_rollout_ref.model.path}
+
+    # Drafter FSDP engine config.
+    engine_config:
+
+      # FSDP strategy.
+      strategy: fsdp
+
+      # Keep params as regular tensors under FSDP1.
+      use_orig_params: True
+
+      # FSDP group size.
+      fsdp_size: -1
+
+      # Keep draft params on GPU.
+      param_offload: False
+
+      # Keep optimizer state on GPU.
+      optimizer_offload: False
+
+      # Do not remove padding inside the drafter engine.
+      use_remove_padding: False
+
+    # Drafter optimizer config.
+    optimizer_config:
+
+      # Learning rate.
+      lr: 1.0e-4
+
+      # Weight decay.
+      weight_decay: 0.0
+
+      # Warmup ratio.
+      lr_warmup_steps_ratio: 0.015
+
+      # LR scheduler type.
+      lr_scheduler_type: cosine
+
+      # Min LR ratio.
+      min_lr_ratio: 0.0
+
+      # Gradient clipping norm.
+      clip_grad: 0.5
+
+      # Filled from trainer.total_training_steps at runtime.
+      total_training_steps: -1
+
+    # Drafter checkpoint config.
+    checkpoint_config:
+
+      # Saved checkpoint contents.
+      save_contents: ["model", "optimizer", "extra"]
+
+      # Loaded checkpoint contents.
+      load_contents: ${actor_rollout_ref.drafter.checkpoint_config.save_contents}
+
+# Disable PPO-only behavior by default.
+algorithm:
+
+  # GRPO avoids critic requirements in validation.
+  adv_estimator: grpo
+
+  # No reward KL in drafter pretraining.
+  use_kl_in_reward: False
+
+# Trainer defaults for drafter pretraining.
+trainer:
+
+  # Project name for experiment tracking.
+  project_name: draft_model_pretrain
+
+  # Experiment name for experiment tracking.
+  experiment_name: pretrain
+
+  # Logging backends.
+  logger: ["console"]
+
+  # Number of epochs over the pretrain dataset.
+  total_epochs: 1
+
+  # Override to cap total steps independent of dataset size.
+  total_training_steps: null
+
+  # Save drafter checkpoint frequency.
+  save_freq: -1
+
+  # Validation frequency. A final validation pass runs when eval_files is set.
+  test_freq: -1
+
+  # Do not run PPO validation.
+  val_before_train: False
+
+  # Use the new worker implementation required by ActorRolloutRefDrafterWorker.
+  use_legacy_worker_impl: disable

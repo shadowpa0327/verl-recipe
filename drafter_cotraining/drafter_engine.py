@@ -68,6 +68,7 @@ class DrafterModelConfig(BaseConfig):
     local_path: Optional[str] = None
     dtype: str = "bfloat16"
     ttt_length: int = 7
+    attention_backend: str = "flex_attention"
 
     # Path to the target (verifier) model — a HF repo id or local dir. We load
     # three frozen weights from here at drafter init:
@@ -209,9 +210,11 @@ class FSDPDrafterEngine(FSDPEngine):
         # Auto-derive draft architecture from the target's HF AutoConfig.
         # local_path is an optional template overlay — see auto.py.
         draft_config = AutoDraftModelConfig.from_target(target_path, template_path=local_path)
+        attention_backend = getattr(self.model_config, "attention_backend", "flex_attention")
         draft_model = AutoEagle3DraftModel.from_config(
             draft_config,
             torch_dtype=getattr(torch, self.model_config.dtype, torch.bfloat16),
+            attention_backend=attention_backend,
         )
 
         # Every rank loads embed_tokens from the target checkpoint. FSDP1 doesn't
@@ -227,7 +230,11 @@ class FSDPDrafterEngine(FSDPEngine):
             draft_model.freeze_embedding()
 
         ttt_length = int(getattr(self.model_config, "ttt_length", 7))
-        module = Eagle3Model(draft_model, length=ttt_length)
+        module = Eagle3Model(
+            draft_model,
+            length=ttt_length,
+            attention_backend=attention_backend,
+        )
 
         # apply_fsdp2 reads model._no_split_modules to pick the wrap targets.
         # Eagle3Model has exactly one LlamaDecoderLayer (as draft_model.midlayer);
