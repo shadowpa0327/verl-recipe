@@ -30,6 +30,31 @@ import sys
 import time
 
 
+def _setup_ipv6_environment():
+    """Set up environment for IPv6-only environments.
+
+    Must be called BEFORE importing mooncake.
+    Returns True if IPv6-only mode was configured.
+    """
+    # Check if we're in IPv6-only environment
+    try:
+        result = subprocess.run(["hostname", "-I"], capture_output=True, text=True)
+        has_ipv4 = any("." in addr and ":" not in addr for addr in result.stdout.strip().split())
+        if has_ipv4:
+            return False
+    except Exception:
+        return False
+
+    # Set MC_USE_IPV6 for the client
+    os.environ["MC_USE_IPV6"] = "1"
+    print("[IPv6] MC_USE_IPV6=1 enabled for client (P2PHANDSHAKE mode)")
+    return True
+
+
+# Set up IPv6 environment BEFORE any other imports
+_IPV6_MODE = _setup_ipv6_environment()
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Test Mooncake store put/get/remove")
     parser.add_argument("--master-host", default="localhost", help="Mooncake master host")
@@ -58,8 +83,10 @@ def parse_args():
 
 def _wait_for_port(host: str, port: int, timeout: float = 10.0) -> bool:
     deadline = time.time() + timeout
+    # Use appropriate socket family for IPv6
+    sock_family = socket.AF_INET6 if ":" in host else socket.AF_INET
     while time.time() < deadline:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        with socket.socket(sock_family, socket.SOCK_STREAM) as s:
             s.settimeout(0.5)
             try:
                 s.connect((host, port))
@@ -76,25 +103,49 @@ def launch_local_master(args) -> "subprocess.Popen | None":
     (no Ray actor needed for a simple sanity test). Returns None if the
     binary is missing.
     """
-    from recipe.drafter_cotraining.mooncake.master import resolve_mooncake_master_bin
+    from recipe.drafter_cotraining.mooncake.master import (
+        resolve_mooncake_master_bin,
+        _is_ipv6_only_environment,
+    )
 
     bin_path = resolve_mooncake_master_bin()
     if not os.path.exists(bin_path):
         print(f"  mooncake_master binary not found at {bin_path}; skipping launch")
         return None
 
-    cmd = [
-        bin_path,
-        f"--port={args.master_port}",
-        f"--http_metadata_server_port={args.metadata_port}",
-        "--enable_http_metadata_server=true",
-    ]
-    print(f"  Launching mooncake_master: {' '.join(cmd)}")
+    # Detect IPv6-only environment for P2PHANDSHAKE mode
+    ipv6_only = _is_ipv6_only_environment()
+
+    if ipv6_only:
+        # In IPv6-only environments, use P2PHANDSHAKE mode:
+        # - Disable HTTP metadata server (coro_http has IPv6 DNS resolution bug)
+        # - Bind RPC to :: (IPv6 any address)
+        cmd = [
+            bin_path,
+            f"--rpc_port={args.master_port}",
+            "--rpc_address=::",
+            "--enable_http_metadata_server=false",
+            "--enable_metric_reporting=false",
+        ]
+        env = os.environ.copy()
+        env["MC_USE_IPV6"] = "1"
+        print(f"  Launching mooncake_master (IPv6-only/P2PHANDSHAKE mode): {' '.join(cmd)}")
+    else:
+        cmd = [
+            bin_path,
+            f"--rpc_port={args.master_port}",
+            f"--http_metadata_server_port={args.metadata_port}",
+            "--enable_http_metadata_server=true",
+        ]
+        env = os.environ.copy()
+        print(f"  Launching mooncake_master: {' '.join(cmd)}")
+
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         preexec_fn=os.setsid,  # so we can kill the whole process group
+        env=env,
     )
 
     def _cleanup():
@@ -110,16 +161,33 @@ def launch_local_master(args) -> "subprocess.Popen | None":
 
     atexit.register(_cleanup)
 
-    if not _wait_for_port(args.master_host, args.master_port, timeout=10.0):
-        print(f"  mooncake_master did not become reachable on {args.master_host}:{args.master_port}")
+    # In IPv6-only environments, use ::1 instead of localhost
+    connect_host = args.master_host
+    if ipv6_only and args.master_host in ("localhost", "127.0.0.1"):
+        connect_host = "::1"
+
+    if not _wait_for_port(connect_host, args.master_port, timeout=30.0):
+        print(f"  mooncake_master did not become reachable on {connect_host}:{args.master_port}")
         _cleanup()
         sys.exit(1)
-    if not _wait_for_port(args.master_host, args.metadata_port, timeout=10.0):
-        print(f"  metadata server did not become reachable on {args.master_host}:{args.metadata_port}")
-        _cleanup()
-        sys.exit(1)
-    print(f"  mooncake_master ready on {args.master_host}:{args.master_port} "
-          f"(metadata :{args.metadata_port}), PID={proc.pid}\n")
+
+    # Skip metadata port check in IPv6-only mode (P2PHANDSHAKE)
+    if not ipv6_only:
+        if not _wait_for_port(connect_host, args.metadata_port, timeout=30.0):
+            print(f"  metadata server did not become reachable on {connect_host}:{args.metadata_port}")
+            _cleanup()
+            sys.exit(1)
+        print(f"  mooncake_master ready on {connect_host}:{args.master_port} "
+              f"(metadata :{args.metadata_port}), PID={proc.pid}\n")
+    else:
+        print(f"  mooncake_master ready on {connect_host}:{args.master_port} "
+              f"(P2PHANDSHAKE mode), PID={proc.pid}\n")
+        # Set metadata_server for P2PHANDSHAKE mode
+        args.p2p_handshake = True
+
+    # Update args.master_host so downstream code uses the correct address
+    args.master_host = connect_host
+    args.ipv6_only = ipv6_only
     return proc
 
 
@@ -154,14 +222,30 @@ def test_config(args, MooncakeConfig):
     print("Step 2: Testing MooncakeConfig")
     print("=" * 60)
 
-    config = MooncakeConfig.from_master_address(
-        master_host=args.master_host,
-        master_port=args.master_port,
-        metadata_port=args.metadata_port,
-        protocol=args.protocol,
-        max_seq_len=args.seq_len,
-        hidden_dim=args.hidden_dim,
-    )
+    # Use P2PHANDSHAKE for IPv6-only environments
+    if getattr(args, "ipv6_only", False):
+        config = MooncakeConfig(
+            local_hostname=args.master_host if ":" in args.master_host else "::1",
+            metadata_server="P2PHANDSHAKE",
+            master_server_address=f"[{args.master_host}]:{args.master_port}" if ":" in args.master_host else f"{args.master_host}:{args.master_port}",
+            global_segment_size=4294967296,
+            local_buffer_size=536870912,
+            host_buffer_size=8388608,
+            protocol=args.protocol,
+            device_name="",
+            enable_gpu_direct=False,
+            max_seq_len=args.seq_len,
+            hidden_dim=args.hidden_dim,
+        )
+    else:
+        config = MooncakeConfig.from_master_address(
+            master_host=args.master_host,
+            master_port=args.master_port,
+            metadata_port=args.metadata_port,
+            protocol=args.protocol,
+            max_seq_len=args.seq_len,
+            hidden_dim=args.hidden_dim,
+        )
 
     print(f"  master_server_address: {config.master_server_address}")
     print(f"  metadata_server:       {config.metadata_server}")
@@ -300,10 +384,11 @@ def main():
     args = parse_args()
 
     MooncakeConfig, EagleMooncakeStore, Eagle3TargetOutput, calc_buf = test_imports()
-    config = test_config(args, MooncakeConfig)
     test_buffer_size(args, calc_buf)
 
     if args.dry_run:
+        # For dry-run, create config with defaults
+        config = test_config(args, MooncakeConfig)
         print("=" * 60)
         print("Dry run complete. All imports and config OK.")
         print("Run without --dry-run with a Mooncake master to test put/get/remove.")
@@ -318,6 +403,8 @@ def main():
             print("Master not launched; pass --no-launch-master and start one yourself.")
             sys.exit(1)
 
+    # Create config AFTER master is launched (so args.master_host is updated for IPv6)
+    config = test_config(args, MooncakeConfig)
     success = test_put_get_remove(args, config, EagleMooncakeStore, Eagle3TargetOutput)
 
     print("=" * 60)

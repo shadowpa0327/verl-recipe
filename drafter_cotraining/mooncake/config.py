@@ -188,6 +188,15 @@ class MooncakeConfig:
         )
         os.environ["MOONCAKE_GET_RETRY_MAX_WAIT_SECONDS"] = str(self.get_retry_max_wait_seconds)
 
+        # Enable IPv6 mode for IPv6 addresses
+        master_addr = self.master_server_address
+        is_ipv6 = (
+            master_addr.startswith("[") or  # [::1]:port
+            (":" in master_addr and master_addr.count(":") >= 2)  # ::1:port or full IPv6
+        )
+        if is_ipv6:
+            os.environ["MC_USE_IPV6"] = "1"
+
     @classmethod
     def from_env(cls) -> "MooncakeConfig":
         """Create config from environment variables."""
@@ -251,10 +260,19 @@ class MooncakeConfig:
         Create config from master address.
 
         Assumes the master is running with built-in HTTP metadata server enabled.
+        Handles IPv6 addresses by using bracket notation.
         """
+        # Handle IPv6 addresses with bracket notation
+        if ":" in master_host and not master_host.startswith("["):
+            # IPv6 without brackets - add them
+            master_server_address = f"[{master_host}]:{master_port}"
+            metadata_server = f"http://[{master_host}]:{metadata_port}/metadata"
+        else:
+            master_server_address = f"{master_host}:{master_port}"
+            metadata_server = f"http://{master_host}:{metadata_port}/metadata"
         return cls(
-            metadata_server=f"http://{master_host}:{metadata_port}/metadata",
-            master_server_address=f"{master_host}:{master_port}",
+            metadata_server=metadata_server,
+            master_server_address=master_server_address,
             **kwargs,
         )
 

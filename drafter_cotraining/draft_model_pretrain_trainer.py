@@ -685,15 +685,50 @@ def _launch_mooncake_master_if_needed(config):
 
     from recipe.drafter_cotraining.mooncake.master import launch_mooncake_master
 
+    # Parse metadata port from URL (e.g., "http://localhost:8090/metadata")
+    # For P2PHANDSHAKE mode, use a dummy port (master will ignore it)
+    metadata_server = config.mooncake.metadata_server
+    if metadata_server == "P2PHANDSHAKE":
+        metadata_port = 8090  # Dummy port, ignored in IPv6-only mode
+    else:
+        try:
+            metadata_port = int(
+                metadata_server.rsplit(":", 1)[1].split("/")[0]
+            )
+        except (ValueError, IndexError):
+            metadata_port = 8090  # Default fallback
+
     args = SimpleNamespace(
         mooncake_master_server_address=config.mooncake.master_server_address,
-        mooncake_metadata_port=int(
-            config.mooncake.metadata_server.rsplit(":", 1)[1].split("/")[0]
-        ),
+        mooncake_metadata_port=metadata_port,
+        mooncake_metadata_server=config.mooncake.metadata_server,
+        mooncake_local_hostname=config.mooncake.local_hostname,
         mooncake_kv_lease_ttl_s=float(config.mooncake.kv_lease_ttl_s),
     )
     if launch_mooncake_master(args) is None:
         sys.exit("mooncake_master failed to launch (binary missing?)")
+
+    # Propagate resolved addresses back into the Hydra config so all Ray workers
+    # (vLLM connector + reachability probe) target the same reachable endpoints.
+    # This also avoids localhost/IPv6 ambiguity when running on multi-node Ray.
+    try:
+        resolved_master = getattr(args, "mooncake_master_server_address", None)
+        resolved_meta = getattr(args, "mooncake_metadata_server", None)
+        if resolved_master:
+            config.mooncake.master_server_address = resolved_master
+            # Extract host from address, handling IPv6 bracket notation
+            if resolved_master.startswith("["):
+                # IPv6: [::1]:port -> ::1
+                bracket_end = resolved_master.find("]")
+                config.mooncake.local_hostname = resolved_master[1:bracket_end]
+            else:
+                # IPv4: host:port -> host
+                config.mooncake.local_hostname = resolved_master.rsplit(":", 1)[0]
+        if resolved_meta:
+            config.mooncake.metadata_server = resolved_meta
+    except Exception:
+        # Best-effort; downstream reachability checks will still fail with a clear error.
+        pass
 
 
 def _ensure_ray_initialized(config):

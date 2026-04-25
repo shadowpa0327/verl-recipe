@@ -18,12 +18,12 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import os
 import threading
 from abc import ABC
 from typing import Dict, Optional
 
 import torch
-from mooncake.store import MooncakeDistributedStore
 
 from recipe.drafter_cotraining.mooncake.config import MooncakeConfig
 from recipe.drafter_cotraining.mooncake.buffers import (
@@ -72,6 +72,28 @@ class MooncakeHiddenStateStore(ABC):
                 "which may fail on hosts with mixed IB subnets. "
                 "Set mooncake.device_name to a specific RDMA device (e.g. 'mlx5_0')."
             )
+
+        # Enable IPv6 mode for IPv6-only environments
+        # Check if we're using IPv6 addresses (with or without brackets)
+        master_addr = self.config.master_server_address
+        is_ipv6 = (
+            master_addr.startswith("[") or  # [::1]:port
+            (":" in master_addr and master_addr.count(":") >= 2)  # ::1:port or full IPv6
+        )
+        if is_ipv6:
+            os.environ.setdefault("MC_USE_IPV6", "1")
+            # Note: Client only needs MC_USE_IPV6=1
+            #
+            # The master uses P2PHANDSHAKE mode (metadata_server="P2PHANDSHAKE")
+            # to avoid coro_http's IPv6 DNS resolution bug. In this mode:
+            # - The HTTP metadata server is disabled (--enable_http_metadata_server=false)
+            # - Clients use peer-to-peer handshaking instead of HTTP metadata
+            # - This bypasses the coro_http library which cannot resolve "0.0.0.0"
+            #   in IPv6-only environments
+
+        # Import here after environment variables are set, so IPv6 mode is configured
+        # before the C++ library initializes
+        from mooncake.store import MooncakeDistributedStore
 
         self._store = MooncakeDistributedStore()
         logger.info(
