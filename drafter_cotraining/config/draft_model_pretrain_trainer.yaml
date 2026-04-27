@@ -256,11 +256,12 @@ actor_rollout_ref:
     # Drafter FSDP engine config.
     engine_config:
 
-      # FSDP strategy.
-      strategy: fsdp
-
-      # Keep params as regular tensors under FSDP1.
-      use_orig_params: True
+      # FSDP2 with selective wrap (TorchSpec-style): only LlamaDecoderLayer
+      # gets its own FSDP unit; lm_head/norm/fc/embed_tokens stay in the root
+      # unit so they remain gathered through backward (auto-root-detect sets
+      # the root's effective reshard_after_forward=False). The override lives
+      # in FSDPDrafterEngine._build_fsdp_module — see drafter_engine.py.
+      strategy: fsdp2
 
       # FSDP group size.
       fsdp_size: -1
@@ -273,6 +274,13 @@ actor_rollout_ref:
 
       # Do not remove padding inside the drafter engine.
       use_remove_padding: False
+
+      # Per-GPU micro-batch size for update_drafter accumulation. Total samples
+      # per macro-step is data.train_batch_size; accumulation_steps =
+      # ceil(B_per_rank / micro_batch_size_per_gpu). micro_size=1 minimizes peak
+      # resident memory for target_p_padded; raise it for fewer accumulation
+      # steps when memory permits.
+      micro_batch_size_per_gpu: 1
 
     # Drafter optimizer config.
     optimizer_config:

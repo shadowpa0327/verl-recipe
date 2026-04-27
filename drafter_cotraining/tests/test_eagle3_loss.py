@@ -5,9 +5,7 @@ Mirrors reference/TorchSpec/tests/test_eagle3_loss.py but imports from recipe.dr
 Verifies that:
 1. compiled_forward_kl_loss matches a naive reference implementation.
 2. compute_target_p_padded produces correct shapes and valid probabilities
-   for both pruning and non-pruning paths.
-3. The lazy target path (non-pruning, target_p_padded=None) produces identical
-   losses to the pre-computed target_p_padded path.
+   for both pruning (t2d set) and no-pruning (t2d=None) paths.
 """
 
 import unittest
@@ -20,13 +18,9 @@ from recipe.drafter_cotraining.eagle3.draft.llama3_eagle import LlamaForCausalLM
 from recipe.drafter_cotraining.eagle3.eagle3_model import (
     Eagle3Model,
     PrecomputedTarget,
-    compute_lazy_target_padded,
     compute_target_p_padded,
 )
-from recipe.drafter_cotraining.eagle3.ops.loss import (
-    compiled_forward_kl_loss,
-    compiled_forward_kl_loss_from_hs,
-)
+from recipe.drafter_cotraining.eagle3.ops.loss import compiled_forward_kl_loss
 
 
 def _reference_forward_kl_loss(hs_flat, target_p_flat, norm_weight, lm_head_weight, norm_eps):
@@ -210,90 +204,42 @@ class TestComputeTargetPPadded(unittest.TestCase):
 
         self.assertTrue((result.position_mask[:, : T // 2] == 0).all())
 
+    def test_no_pruning_full_vocab(self):
+        """When t2d=None, project to V_full, position_mask is None, target_p is bf16."""
+        torch.manual_seed(0)
+        B, T, D, V = 2, 16, 64, 1000
+        length = 7
+        hs = torch.randn(B, T, D, dtype=torch.bfloat16)
+        weight = torch.randn(V, D, dtype=torch.bfloat16)
+        loss_mask = torch.ones(B, T)
 
-class TestLazyVsPrecomputedTarget(unittest.TestCase):
-    """The lazy path (target_p_padded=None) must produce identical losses."""
-
-    def _run_both_paths(self, device="cpu"):
-        torch.manual_seed(42)
-        H, V, B, T, length = 128, 256, 1, 32, 3
-
-        config = _make_config(H=H, V=V)
-        model = _make_model(config, length=length, device=device)
-        batch = _make_batch(B, T, H, V, device=device)
-
-        draft_model = model.draft_model
-        _, lm_head_weight, _ = draft_model.get_lm_head_params()
-
-        with torch.no_grad():
-            target_logits = F.linear(batch["target_hidden_states"], lm_head_weight.detach())
-            target_p = F.softmax(target_logits.float(), dim=-1)
-        target_p_padded = F.pad(target_p, (0, 0, 0, length), value=0.0)
-
-        precomputed = PrecomputedTarget(target_p_padded)
-        with torch.no_grad():
-            plosses_pre, _, acces_pre = model(
-                input_ids=batch["input_ids"],
-                attention_mask=batch["attention_mask"],
-                target=precomputed,
-                loss_mask=batch["loss_mask"],
-                hidden_states=batch["hidden_states"],
-            )
-
-        lazy = compute_lazy_target_padded(
-            batch["target_hidden_states"],
-            lm_head_weight,
-            length,
+        result = compute_target_p_padded(
+            hs,
+            weight,
+            loss_mask=loss_mask,
+            length=length,
+            t2d=None,
         )
-        with torch.no_grad():
-            plosses_lazy, _, acces_lazy = model(
-                input_ids=batch["input_ids"],
-                attention_mask=batch["attention_mask"],
-                target=lazy,
-                loss_mask=batch["loss_mask"],
-                hidden_states=batch["hidden_states"],
-            )
+        self.assertEqual(result.target_p_padded.shape, (B, T + length, V))
+        self.assertIsNone(result.position_mask)
+        self.assertEqual(result.target_p_padded.dtype, torch.bfloat16)
+        # Probabilities sum to ~1 along the vocab dim (within bf16 precision).
+        sums = result.target_p_padded[:, :T, :].sum(dim=-1).float()
+        torch.testing.assert_close(sums, torch.ones_like(sums), atol=1e-2, rtol=1e-2)
 
-        return plosses_pre, acces_pre, plosses_lazy, acces_lazy
-
-    def test_losses_match_cpu(self):
-        plosses_pre, acces_pre, plosses_lazy, acces_lazy = self._run_both_paths("cpu")
-        for i, (pre, lazy) in enumerate(zip(plosses_pre, plosses_lazy)):
-            torch.testing.assert_close(
-                pre,
-                lazy,
-                atol=1e-4,
-                rtol=1e-4,
-                msg=f"Loss mismatch at position {i}",
-            )
-        for i, (pre, lazy) in enumerate(zip(acces_pre, acces_lazy)):
-            torch.testing.assert_close(
-                pre,
-                lazy,
-                atol=1e-4,
-                rtol=1e-4,
-                msg=f"Accuracy mismatch at position {i}",
-            )
-
-    @unittest.skipUnless(torch.cuda.is_available(), "CUDA not available")
-    def test_losses_match_cuda(self):
-        plosses_pre, acces_pre, plosses_lazy, acces_lazy = self._run_both_paths("cuda")
-        for i, (pre, lazy) in enumerate(zip(plosses_pre, plosses_lazy)):
-            torch.testing.assert_close(
-                pre,
-                lazy,
-                atol=1e-3,
-                rtol=1e-3,
-                msg=f"Loss mismatch at position {i}",
-            )
-        for i, (pre, lazy) in enumerate(zip(acces_pre, acces_lazy)):
-            torch.testing.assert_close(
-                pre,
-                lazy,
-                atol=1e-3,
-                rtol=1e-3,
-                msg=f"Accuracy mismatch at position {i}",
-            )
+    def test_pruning_returns_bf16(self):
+        """Pruning path also stores target_p in bf16."""
+        torch.manual_seed(0)
+        B, T, D, V_target, V_draft = 1, 8, 32, 128, 32
+        hs = torch.randn(B, T, D, dtype=torch.bfloat16)
+        weight = torch.randn(V_target, D, dtype=torch.bfloat16)
+        loss_mask = torch.ones(B, T)
+        t2d = torch.zeros(V_target, dtype=torch.bool)
+        t2d[:V_draft] = True
+        result = compute_target_p_padded(
+            hs, weight, loss_mask=loss_mask, length=3, t2d=t2d,
+        )
+        self.assertEqual(result.target_p_padded.dtype, torch.bfloat16)
 
 
 class TestRotaryConfigWiring(unittest.TestCase):
@@ -406,43 +352,8 @@ class TestValidIdxSubsetting(unittest.TestCase):
         torch.testing.assert_close(loss, loss_ref, atol=1e-5, rtol=1e-5)
         torch.testing.assert_close(acc, acc_ref, atol=1e-5, rtol=1e-5)
 
-    def _check_forward_kl_from_hs(self, valid_idx):
-        torch.manual_seed(7)
-        hs_flat = torch.randn(self.BT, self.H, dtype=torch.bfloat16)
-        ths_flat = torch.randn(self.BT, self.H, dtype=torch.bfloat16)
-        norm_weight = torch.randn(self.H, dtype=torch.bfloat16)
-        lm_head_weight = torch.randn(self.V, self.H, dtype=torch.bfloat16)
-        target_lm_head_weight = torch.randn(self.V, self.H, dtype=torch.bfloat16)
-        norm_eps = 1e-6
 
-        loss, acc = compiled_forward_kl_loss_from_hs(
-            hs_flat,
-            ths_flat,
-            valid_idx,
-            norm_weight,
-            lm_head_weight,
-            target_lm_head_weight,
-            norm_eps,
-        )
-
-        hs_valid = hs_flat[valid_idx]
-        ths_valid = ths_flat[valid_idx]
-        all_idx = torch.arange(hs_valid.shape[0])
-        loss_ref, acc_ref = compiled_forward_kl_loss_from_hs(
-            hs_valid,
-            ths_valid,
-            all_idx,
-            norm_weight,
-            lm_head_weight,
-            target_lm_head_weight,
-            norm_eps,
-        )
-
-        torch.testing.assert_close(loss, loss_ref, atol=1e-5, rtol=1e-5)
-        torch.testing.assert_close(acc, acc_ref, atol=1e-5, rtol=1e-5)
-
-
-# Dynamically generate one test method per mask pattern per loss function.
+# Dynamically generate one test method per mask pattern.
 for _name, _vidx in _make_mask_patterns(TestValidIdxSubsetting.BT):
 
     def _make_kl(vidx=_vidx):
@@ -451,14 +362,7 @@ for _name, _vidx in _make_mask_patterns(TestValidIdxSubsetting.BT):
 
         return test
 
-    def _make_kl_from_hs(vidx=_vidx):
-        def test(self):
-            self._check_forward_kl_from_hs(vidx)
-
-        return test
-
     setattr(TestValidIdxSubsetting, f"test_forward_kl_{_name}", _make_kl())
-    setattr(TestValidIdxSubsetting, f"test_forward_kl_from_hs_{_name}", _make_kl_from_hs())
 
 
 if __name__ == "__main__":

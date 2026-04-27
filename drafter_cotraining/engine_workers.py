@@ -16,8 +16,10 @@ See claude_docs/rfc-drafter-trainer-integration.md for the full design.
 """
 
 import logging
-from typing import Optional
+import math
+from typing import List, Optional
 
+import numpy as np
 import torch
 from omegaconf import DictConfig
 
@@ -168,17 +170,22 @@ class ActorRolloutRefDrafterWorker(ActorRolloutRefWorker):
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="drafter"))
     def update_drafter(self, data: DataProto):
-        """Receive per-rank shard of Mooncake keys, fetch tensors, collate, train.
+        """Receive per-rank shard of Mooncake keys, fetch tensors paged, train.
 
-        data is already split per DP rank by the drafter mesh dispatch fn.
-        Each entry contains Mooncake keys — actual tensors fetched here.
+        Macro-step shape (mirrors verl's canonical forward_backward_batch):
+          1. Filter out samples with empty loss-mask (pure metadata, no fetch).
+          2. Preflight total_valid_global across DP for an exact mean divisor.
+          3. Pre-compute T_pad_macro across all micro-batches so torch.compile
+             doesn't recompile per micro-batch.
+          4. engine.train_mode: per micro-batch, paged Mooncake.get → forward+TTT
+             → weighted backward (set_requires_gradient_sync(is_last) on FSDP2
+             suppresses inter-rank reduce-scatter on all-but-last micro-batch).
+          5. optimizer_step + lr_scheduler_step.
+          6. Aggregate per-mb metrics → DP all-reduce → meta_info.
 
-        When the drafter engine is initialized (``drafter.model_config.target_model_path``
-        is set) this runs the full Eagle3 training step (prepare_model_inputs →
-        7-step TTT forward → 0.8^i-weighted backward → optimizer step) and
-        returns all-reduced metrics in ``meta_info['train_metrics']``. When the
-        engine is absent it falls back to the shape-print smoke path so the
-        rollout+HS+dispatch pipeline can be exercised without a real draft model.
+        When the drafter engine is absent the function falls back to the
+        single-shot shape-print smoke path so the rollout+HS+dispatch pipeline
+        is still exercisable without a real Eagle3 checkpoint.
         """
         if len(data) == 0:
             return DataProto(non_tensor_batch={})
@@ -190,24 +197,89 @@ class ActorRolloutRefDrafterWorker(ActorRolloutRefWorker):
         import torch.distributed as dist
         rank = dist.get_rank() if dist.is_initialized() else 0
 
-        batch = self._fetch_drafter_batch_from_mooncake(data, rank)
-        if batch is None:
-            return DataProto(non_tensor_batch=data.non_tensor_batch)
-
+        # Smoke-only fallback (no drafter engine): single-shot fetch + log shapes.
         if self.drafter is None:
-            # Smoke-only fallback: no drafter engine configured, so just log
-            # padded shapes per rank and exit. Keeps test_drafter_rollout_hs.py
-            # runnable without a real Eagle3 checkpoint.
+            batch = self._fetch_drafter_batch_from_mooncake(data, rank)
+            if batch is None:
+                return DataProto(non_tensor_batch=data.non_tensor_batch)
             self._log_drafter_batch_shapes(batch, rank)
             return DataProto(non_tensor_batch=data.non_tensor_batch)
 
-        metrics = self._drafter_train_step(batch, rank)
+        # ── Step 1: metadata-only empty-mask filter (TorchSpec data_fetcher.py:177)
+        response_lens = data.non_tensor_batch.get("response_lens", [])
+        if len(response_lens) > 0:
+            keep = [int(r) - 1 > 0 for r in response_lens]
+            n_dropped = sum(1 for k in keep if not k)
+            if n_dropped > 0:
+                logger.warning(
+                    "[drafter rank=%d] dropping %d samples with zero loss-mask positions",
+                    rank, n_dropped,
+                )
+                # Eagerly free Mooncake keys for dropped samples so producer can
+                # reuse buffers — mirrors per-key remove_eagle3_tensors below.
+                store = self._get_mooncake_store(data.meta_info.get("mooncake_cfg", {}), rank)
+                if store is not None:
+                    for i, k in enumerate(keep):
+                        if not k:
+                            try:
+                                store.remove_eagle3_tensors(
+                                    key=str(mooncake_keys[i]),
+                                    has_last_hidden_states=True,
+                                )
+                            except Exception as exc:
+                                logger.debug(
+                                    "Mooncake remove for dropped sample %d failed: %s", i, exc,
+                                )
+                kept_indices = [i for i, k in enumerate(keep) if k]
+                data = self._select_data_indices(data, kept_indices)
+                mooncake_keys = data.non_tensor_batch.get("mooncake_keys", [])
+                response_lens = data.non_tensor_batch.get("response_lens", [])
 
-        # Also log shapes the first time through so the smoke output still
-        # contains the padded-shape sanity line.
-        if not getattr(self, "_drafter_shapes_logged", False):
-            self._log_drafter_batch_shapes(batch, rank)
-            self._drafter_shapes_logged = True
+        if len(mooncake_keys) == 0:
+            logger.warning("[drafter rank=%d] all samples filtered; skipping macro-step", rank)
+            return DataProto(non_tensor_batch=data.non_tensor_batch)
+
+        # ── Step 2: preflight total_valid_global from metadata (no fetch needed)
+        local_total_valid = sum(max(0, int(r) - 1) for r in response_lens)
+        total_valid_global = self._allreduce_sum_int(local_total_valid)
+        if total_valid_global == 0:
+            logger.warning("[drafter rank=%d] total_valid_global=0; skipping", rank)
+            return DataProto(non_tensor_batch=data.non_tensor_batch)
+
+        # ── Step 3: T_pad_macro across all micro-batches AND across DP ranks.
+        # All-reducing MAX makes T_pad identical on every rank → torch.compile
+        # cache doesn't fragment per-rank. Also keeps the resulting
+        # train_metrics dict bitwise-equal across ranks (verl's DataProto.concat
+        # asserts on conflicting meta_info values).
+        prompt_lens = data.non_tensor_batch.get("prompt_lens", [0] * len(mooncake_keys))
+        seq_lens = [int(p) + int(r) for p, r in zip(prompt_lens, response_lens)]
+        local_t_pad = max(seq_lens) if seq_lens else 0
+        t_pad_macro = self._allreduce_max_int(local_t_pad)
+
+        # ── Step 4-5: micro-batch loop + optimizer step
+        # self.config is already the actor_rollout_ref slice (see ray_trainer.py:717
+        # and draft_model_pretrain_trainer.py:288).
+        micro_size = int(
+            self.config.drafter.engine_config.get("micro_batch_size_per_gpu", 1)
+        )
+        accum_steps = max(1, math.ceil(len(mooncake_keys) / micro_size))
+        metrics = self._drafter_train_step_micro(
+            data,
+            rank=rank,
+            micro_size=micro_size,
+            accum_steps=accum_steps,
+            total_valid_global=total_valid_global,
+            t_pad_macro=t_pad_macro,
+        )
+
+        # Don't add per-rank diagnostic fields to train_metrics — verl's
+        # DataProto.concat asserts on conflicting values and per-rank
+        # accum_steps may differ under uneven dispatch. Log on rank 0 instead.
+        if rank == 0:
+            logger.info(
+                "[drafter] macro-step done: accum_steps=%d total_valid_global=%d t_pad_macro=%d",
+                accum_steps, total_valid_global, t_pad_macro,
+            )
 
         return DataProto(
             non_tensor_batch=data.non_tensor_batch,
@@ -245,7 +317,16 @@ class ActorRolloutRefDrafterWorker(ActorRolloutRefWorker):
             meta_info={"eval_metrics": metrics},
         )
 
-    def _fetch_drafter_batch_from_mooncake(self, data: DataProto, rank: int):
+    def _fetch_drafter_batch_from_mooncake(
+        self, data: DataProto, rank: int, t_pad_override: Optional[int] = None,
+    ):
+        """Fetch tensors for the keys in `data` and collate to a rectangular batch.
+
+        t_pad_override: when provided, collator pads to at least this length
+            (still snapped to a 256-token bucket). Lets the macro-step
+            pre-compute T_pad once across all micro-batches so torch.compile
+            doesn't recompile per micro-batch.
+        """
         mooncake_keys = data.non_tensor_batch.get("mooncake_keys", [])
         shapes_list = data.non_tensor_batch.get("shapes", [])
         dtypes_list = data.non_tensor_batch.get("dtypes", [])
@@ -308,7 +389,7 @@ class ActorRolloutRefDrafterWorker(ActorRolloutRefWorker):
                 has_last_hidden_states=out.last_hidden_states is not None,
             )
 
-        return collator(features)
+        return collator(features, bucket_size_override=t_pad_override)
 
     def _log_drafter_batch_shapes(self, batch, rank: int):
         lhs_shape = (
@@ -326,40 +407,211 @@ class ActorRolloutRefDrafterWorker(ActorRolloutRefWorker):
         )
         print("=" * 100)
 
-    def _drafter_train_step(self, batch, rank: int) -> dict:
-        """Real Eagle3 forward + 0.8^i-weighted backward + optimizer step.
+    # ── Micro-batch helpers ──────────────────────────────────
 
-        Uses the drafter engine's ``train_mode`` context so parameter/optimizer
-        offload is handled consistently with how actor training runs. The
-        context also zeros grads on exit. Target model stays frozen — actor
-        updates and drafter→rollout sync are out of scope for this milestone.
+    def _allreduce_sum_int(self, value: int) -> int:
+        """All-reduce SUM of a Python int across the drafter DP group."""
+        import torch.distributed as dist
+        if not dist.is_initialized():
+            return int(value)
+        device = torch.device("cuda", torch.cuda.current_device())
+        t = torch.tensor([int(value)], device=device, dtype=torch.long)
+        dp_group = self.drafter.engine.get_data_parallel_group()
+        dist.all_reduce(t, op=dist.ReduceOp.SUM, group=dp_group)
+        return int(t.item())
+
+    def _allreduce_max_int(self, value: int) -> int:
+        """All-reduce MAX of a Python int across the drafter DP group.
+
+        Used for T_pad_macro so all ranks pad to the same length →
+        torch.compile cache stays unified across ranks AND collated metrics
+        don't conflict.
+        """
+        import torch.distributed as dist
+        if not dist.is_initialized():
+            return int(value)
+        device = torch.device("cuda", torch.cuda.current_device())
+        t = torch.tensor([int(value)], device=device, dtype=torch.long)
+        dp_group = self.drafter.engine.get_data_parallel_group()
+        dist.all_reduce(t, op=dist.ReduceOp.MAX, group=dp_group)
+        return int(t.item())
+
+    def _select_data_indices(self, data: DataProto, indices: List[int]) -> DataProto:
+        """Filter a DataProto's non_tensor_batch (and tensor batch if present)
+        to the given indices. Used by the metadata-time empty-mask filter and
+        by the per-micro-batch slicer."""
+        new_nt = {}
+        for k, v in data.non_tensor_batch.items():
+            if isinstance(v, np.ndarray):
+                new_nt[k] = v[np.asarray(indices, dtype=np.int64)]
+            elif isinstance(v, list):
+                new_nt[k] = [v[i] for i in indices]
+            else:
+                new_nt[k] = v
+        new_tb = None
+        if data.batch is not None:
+            new_tb = data.batch[indices]
+        return DataProto(batch=new_tb, non_tensor_batch=new_nt, meta_info=dict(data.meta_info))
+
+    def _iter_micro_batch_keys(self, data: DataProto, micro_size: int):
+        """Yield (mb_idx, sub_data) DataProto slices over Mooncake keys."""
+        n = len(data.non_tensor_batch.get("mooncake_keys", []))
+        if n == 0:
+            return
+        for mb_idx, start in enumerate(range(0, n, micro_size)):
+            end = min(start + micro_size, n)
+            sub = self._select_data_indices(data, list(range(start, end)))
+            yield mb_idx, sub
+
+    def _drafter_train_step_micro(
+        self,
+        data: DataProto,
+        rank: int,
+        micro_size: int,
+        accum_steps: int,
+        total_valid_global: int,
+        t_pad_macro: int,
+    ) -> dict:
+        """Outer loop: train_mode + per-micro-batch fetch+forward+backward + optimizer step.
+
+        Mirrors verl's canonical forward_backward_batch divisor pattern: each
+        micro-batch's contribution is `mb_valid / total_valid_global`, so summing
+        N backwards reproduces single-batch mean semantics exactly.
+
+        FSDP2-only: set_requires_gradient_sync(is_last) suppresses inter-rank
+        reduce-scatter on all-but-last micro-batch (mirrors TorchSpec). On FSDP1
+        the attribute is missing → no-op via getattr guard.
         """
         engine = self.drafter.engine
         device = torch.device("cuda", torch.cuda.current_device())
 
-        # Move collator output onto GPU (some entries may already be there if
-        # Eagle3Collator preserved device from per-sample tensors).
-        batch_dev = {
-            k: (v.to(device) if torch.is_tensor(v) else v) for k, v in batch.items()
-        }
+        fsdp_root = engine.module
+        set_grad_sync = getattr(fsdp_root, "set_requires_gradient_sync", None)
 
+        accum_metrics = []
         with engine.train_mode():
-            prepared = engine.prepare_model_inputs(batch_dev)
-            plosses, _, acces = engine.module(**prepared)
+            for mb_idx, mb_data in self._iter_micro_batch_keys(data, micro_size):
+                is_last = mb_idx == accum_steps - 1
+                if set_grad_sync is not None:
+                    set_grad_sync(is_last)
 
-            num_ttt = len(plosses)
-            loss_weights = [0.8 ** i for i in range(num_ttt)]
-            # accumulation_steps=1 for this milestone — one rollout batch per
-            # optimizer step (see tasks/drafter-training-milestone.md §3.2).
-            loss = sum(w * p for w, p in zip(loss_weights, plosses)) / 1.0
-            loss.backward()
+                mb_batch = self._fetch_drafter_batch_from_mooncake(
+                    mb_data, rank, t_pad_override=t_pad_macro,
+                )
+                if mb_batch is None:
+                    continue
+
+                # First-mb-only shape print (smoke continuity).
+                if mb_idx == 0 and not getattr(self, "_drafter_shapes_logged", False):
+                    self._log_drafter_batch_shapes(mb_batch, rank)
+                    self._drafter_shapes_logged = True
+
+                mb_metrics = self._drafter_micro_step(
+                    mb_batch,
+                    rank=rank,
+                    total_valid_global=total_valid_global,
+                    device=device,
+                )
+                accum_metrics.append(mb_metrics)
+
+            # Re-enable sync before optimizer step (defensive; optimizer_step
+            # itself doesn't trigger comms but keeps engine state predictable).
+            if set_grad_sync is not None:
+                set_grad_sync(True)
 
             grad_norm = engine.optimizer_step()
             lr = engine.lr_scheduler_step()
 
+        return self._aggregate_micro_metrics(accum_metrics, grad_norm, lr, rank)
+
+    def _drafter_micro_step(
+        self, mb_batch, rank: int, total_valid_global: int, device,
+    ) -> dict:
+        """Per-micro-batch: prepare → forward → weighted backward → free."""
+        engine = self.drafter.engine
+        batch_dev = {
+            k: (v.to(device) if torch.is_tensor(v) else v) for k, v in mb_batch.items()
+        }
+        prepared = engine.prepare_model_inputs(batch_dev)
+        plosses, _, acces = engine.module(**prepared)
+
+        num_ttt = len(plosses)
+        loss_weights = [0.8 ** i for i in range(num_ttt)]
+
+        # Local valid count drives the per-mb scale factor. Use position_mask
+        # (vocab pruning subset) when present; else use loss_mask.
+        target_obj = prepared["target"]
+        position_mask = getattr(target_obj, "position_mask", None)
+        if position_mask is not None:
+            mb_valid = int(position_mask.sum().item())
+        else:
+            mb_valid = int(prepared["loss_mask"].sum().item())
+
+        if mb_valid == 0 or total_valid_global <= 0:
+            # Skip backward; in-kernel fallback already produced zero-grad
+            # touching all params, so FSDP's reduce-scatter on the LAST mb still
+            # works. Don't accumulate this mb's loss into the macro divisor.
+            return {
+                "plosses": [p.detach() for p in plosses],
+                "acces": [a.detach() for a in acces],
+                "loss_weights": loss_weights,
+                "mb_valid": 0,
+            }
+
+        # Exact mean divisor: Σ_k (mb_valid_k / total_valid_global) · per_pos_mean_k
+        # = (1 / total_valid_global) · Σ_k Σ_pos per_pos_loss = mean over total valid.
+        scale = mb_valid / total_valid_global
+        weighted = sum(w * p * scale for w, p in zip(loss_weights, plosses))
+        weighted.backward()
+
+        out = {
+            "plosses": [p.detach() for p in plosses],
+            "acces": [a.detach() for a in acces],
+            "loss_weights": loss_weights,
+            "mb_valid": mb_valid,
+        }
+        # Eagerly free heavy tensors before next fetch.
+        del prepared, plosses, acces, weighted, batch_dev, target_obj
+        return out
+
+    def _aggregate_micro_metrics(
+        self, accum_metrics: list, grad_norm, lr, rank: int,
+    ) -> dict:
+        """Combine per-micro-batch losses (already weighted by mb_valid/total) and
+        accuracies (weighted by mb_valid). Reuses _aggregate_drafter_metrics for
+        the DP all-reduce + final dict shape so smoke output is unchanged."""
+        if not accum_metrics:
+            # No effective work this macro-step; return a minimal metrics dict.
+            return {
+                "train/loss_weighted": 0.0,
+                "train/avg_acc": 0.0,
+                "train/simulated_acc_len": 0.0,
+            }
+        num_ttt = len(accum_metrics[0]["plosses"])
+        loss_weights = accum_metrics[0]["loss_weights"]
+        total_valid = sum(m["mb_valid"] for m in accum_metrics)
+
+        device = accum_metrics[0]["plosses"][0].device
+        if total_valid == 0:
+            zero = torch.zeros((), device=device)
+            combined_plosses = [zero for _ in range(num_ttt)]
+            combined_acces = [zero for _ in range(num_ttt)]
+        else:
+            combined_plosses = []
+            combined_acces = []
+            for ttt_i in range(num_ttt):
+                ploss_sum = sum(
+                    m["plosses"][ttt_i] * m["mb_valid"] for m in accum_metrics
+                ) / total_valid
+                acc_sum = sum(
+                    m["acces"][ttt_i] * m["mb_valid"] for m in accum_metrics
+                ) / total_valid
+                combined_plosses.append(ploss_sum)
+                combined_acces.append(acc_sum)
+
         return self._aggregate_drafter_metrics(
-            plosses=plosses,
-            acces=acces,
+            plosses=combined_plosses,
+            acces=combined_acces,
             loss_weights=loss_weights,
             grad_norm=grad_norm,
             lr=lr,
@@ -591,7 +843,14 @@ class DrafterPretrainWorker(Worker):
     evaluate_drafter = ActorRolloutRefDrafterWorker.evaluate_drafter
     _fetch_drafter_batch_from_mooncake = ActorRolloutRefDrafterWorker._fetch_drafter_batch_from_mooncake
     _log_drafter_batch_shapes = ActorRolloutRefDrafterWorker._log_drafter_batch_shapes
-    _drafter_train_step = ActorRolloutRefDrafterWorker._drafter_train_step
+    # Micro-batch helpers (Phase C):
+    _allreduce_sum_int = ActorRolloutRefDrafterWorker._allreduce_sum_int
+    _allreduce_max_int = ActorRolloutRefDrafterWorker._allreduce_max_int
+    _select_data_indices = ActorRolloutRefDrafterWorker._select_data_indices
+    _iter_micro_batch_keys = ActorRolloutRefDrafterWorker._iter_micro_batch_keys
+    _drafter_train_step_micro = ActorRolloutRefDrafterWorker._drafter_train_step_micro
+    _drafter_micro_step = ActorRolloutRefDrafterWorker._drafter_micro_step
+    _aggregate_micro_metrics = ActorRolloutRefDrafterWorker._aggregate_micro_metrics
     _drafter_eval_step = ActorRolloutRefDrafterWorker._drafter_eval_step
     _aggregate_drafter_metrics = ActorRolloutRefDrafterWorker._aggregate_drafter_metrics
     _get_mooncake_store = ActorRolloutRefDrafterWorker._get_mooncake_store

@@ -32,7 +32,7 @@ Frozen modules (embed_tokens, verifier_norm, target_lm_head_weight):
     from target_lm_head_weight (frozen, for target distribution).
 
 Usage:
-    engine = EngineRegistry.new("drafter_model", "fsdp", "cuda", ...)
+    engine = EngineRegistry.new("drafter_model", "fsdp2", "cuda", ...)
     engine.sync_frozen_modules_from_actor(actor_embed, actor_norm)
 """
 
@@ -163,7 +163,7 @@ def build_drafter_subconfig(cfg, cls):
     return cls(**kwargs)
 
 
-@EngineRegistry.register(model_type="drafter_model", backend=["fsdp", "fsdp2"], device=["cuda", "npu"])
+@EngineRegistry.register(model_type="drafter_model", backend=["fsdp2"], device=["cuda", "npu"])
 class FSDPDrafterEngine(FSDPEngine):
     """
     FSDP engine for EAGLE drafter model.
@@ -182,7 +182,7 @@ class FSDPDrafterEngine(FSDPEngine):
         super().__init__(model_config, engine_config, optimizer_config, checkpoint_config)
         # Frozen target-side weights — set by _load_target_frozen_weights()
         self._verifier_norm = None           # RMSNorm for pre-norm last_hs from vLLM
-        self._target_lm_head_weight = None   # target lm_head weight for LazyTarget
+        self._target_lm_head_weight = None   # target lm_head weight for PrecomputedTarget builder
 
     def _build_module(self):
         """Return the Eagle3-wrapped draft model (parent expects a plain nn.Module).
@@ -217,9 +217,12 @@ class FSDPDrafterEngine(FSDPEngine):
             attention_backend=attention_backend,
         )
 
-        # Every rank loads embed_tokens from the target checkpoint. FSDP1 doesn't
-        # do a rank-0-only load + broadcast like FSDP2's fsdp2_load_full_state_dict,
-        # so the weights must be identical on each rank pre-wrap.
+        # Every rank loads embed_tokens from the target checkpoint. We do this
+        # pre-wrap on every rank for simplicity and as a sanity layer; the
+        # post-wrap fsdp2_load_full_state_dict broadcast in _build_fsdp_module
+        # would also reconcile the weights from rank 0, but loading on every
+        # rank costs almost nothing for an Embedding and avoids any window
+        # where ranks disagree.
         target_path = getattr(self.model_config, "target_model_path", None)
         if target_path:
             draft_model.load_embedding(target_path, embedding_key="model.embed_tokens.weight")
@@ -250,6 +253,116 @@ class FSDPDrafterEngine(FSDPEngine):
             "Eagle3Model loaded: %s trainable, %s frozen (%.1fM total)",
             f"{trainable:,}", f"{frozen:,}", (trainable + frozen) / 1e6,
         )
+        return module
+
+    def _build_fsdp_module(self, module):
+        """Selective FSDP2 wrap for the drafter.
+
+        Two `fully_shard()` calls, in order:
+
+          1) `fully_shard(LlamaDecoderLayer)` — gives the midlayer its own FSDP
+             sub-unit. Its 7 Linears (q/k/v/o_proj, gate/up/down_proj) and 2
+             RMSNorms become DTensors managed by this sub-unit; gathered on
+             pre-forward, resharded on post-forward (the FSDP2 default).
+
+          2) `fully_shard(module)` — the root wrap. Per `fully_shard` semantics,
+             every param NOT already in a sub-unit becomes managed by THIS
+             unit. So `lm_head`, `norm`, `fc`, and `embed_tokens` all land in
+             the root unit. They are still DTensors (FSDP2 always shards) —
+             just OWNED by the root unit instead of their own sub-units.
+
+        The whole point is `lm_head` ownership. Our compiled loss kernel reads
+        `lm_head.weight` as an extracted tensor argument:
+
+            logits = F.linear(norm_hs, lm_head_weight)   # NOT lm_head(input)
+
+        bypassing `lm_head.forward()`. If `lm_head` had its own FSDP sub-unit
+        (which is what verl's default `_select_fsdp2_wrap_targets` does when
+        `tie_word_embeddings=False`, e.g. Qwen3-8B), THAT sub-unit's pre-forward
+        hook would only fire on `lm_head(input)` — never on the kernel's
+        extracted-tensor read. The kernel would then see a non-gathered
+        (still-sharded) DTensor and either error with `Tensor × DTensor` or
+        compute on a wrong shape.
+
+        With `lm_head` in the root unit instead:
+          - The root's pre-forward hook fires at the start of every
+            `Eagle3Model.forward()` → gathers `lm_head.weight` to a Replicate
+            DTensor (full shape on every rank).
+          - PyTorch's auto-root-detection forces the root's effective
+            `reshard_after_forward=False` (regardless of what we pass) → the
+            gathered state survives through backward → optimizer step. No
+            reshard between forward and backward.
+          - PyTorch's DTensor dispatch handles `F.linear(plain_input,
+            replicate_dtensor)` correctly by promoting the plain input to a
+            Replicate DTensor → DTensor × DTensor matmul.
+
+        See `verl/utils/fsdp_utils.py:734-766` (`set_reshard_after_forward`
+        docstring) for the auto-root-detection guarantee, and
+        `claude_docs/research/Eagle3-Co-Trained/FSDP2 Wrap — TorchSpec
+        Cross-Reference.md` for the full design rationale and a comparison
+        against TorchSpec's per-Linear granularity.
+
+        FSDP2-only — FSDP1 is intentionally not supported on this engine. The
+        @EngineRegistry.register backend list is `["fsdp2"]`, so an FSDP1
+        config will fail at engine-resolution time. We force the strategy
+        because (a) the FSDP2 selective wrap above is what makes the compiled
+        loss kernel work, (b) FSDP1's `use_orig_params=True` workaround was a
+        compatibility shim from before this engine existed, and (c) supporting
+        both backends doubled the surface area of an already-load-bearing
+        engine for no production benefit.
+        """
+        assert self.engine_config.strategy == "fsdp2", (
+            f"FSDPDrafterEngine is FSDP2-only; got strategy={self.engine_config.strategy!r}. "
+            "Set drafter.engine_config.strategy=fsdp2 in your config."
+        )
+
+        from torch.distributed.fsdp import (
+            CPUOffloadPolicy,
+            MixedPrecisionPolicy,
+            fully_shard,
+        )
+        from verl.utils.fsdp_utils import fsdp2_load_full_state_dict
+
+        param_dtype = getattr(torch, self.model_config.dtype, torch.bfloat16)
+        mp_policy = MixedPrecisionPolicy(
+            param_dtype=param_dtype,
+            reduce_dtype=torch.float32,
+            cast_forward_inputs=True,
+        )
+        offload_policy = (
+            CPUOffloadPolicy(pin_memory=True)
+            if self.engine_config.offload_policy
+            else None
+        )
+        fsdp_kwargs = {
+            "mesh": self.device_mesh,
+            "mp_policy": mp_policy,
+            "offload_policy": offload_policy,
+        }
+
+        # Capture full state PRE-WRAP — fsdp2_load_full_state_dict broadcasts
+        # from rank 0 onto every rank's sharded DTensors after wrap.
+        full_state = module.state_dict()
+
+        # Shard only LlamaDecoderLayer sub-units (TorchSpec-style).
+        # Sub-units default to reshard_after_forward=True.
+        sharded_count = 0
+        for _name, sub in module.named_modules():
+            if sub.__class__.__name__ == "LlamaDecoderLayer":
+                fully_shard(sub, **fsdp_kwargs)
+                sharded_count += 1
+        logger.info(
+            "FSDPDrafterEngine: sharded %d LlamaDecoderLayer sub-units (FSDP2 selective wrap)",
+            sharded_count,
+        )
+
+        # Wrap root. Auto-detected as root → effective reshard_after_forward=False
+        # → root params (lm_head, norm, fc, embed_tokens) stay gathered through bwd,
+        # which is what the compiled loss kernel needs.
+        fully_shard(module, **fsdp_kwargs)
+
+        # Broadcast rank-0 full state onto all ranks' sharded DTensors.
+        fsdp2_load_full_state_dict(module, full_state, self.device_mesh, offload_policy)
         return module
 
     def initialize(self):
@@ -422,8 +535,10 @@ class FSDPDrafterEngine(FSDPEngine):
     def prepare_model_inputs(self, micro_batch: TensorDict):
         """Prepare inputs for Eagle3Model.forward().
 
-        Handles verifier_norm and target construction before calling
-        the 7-step TTT loop.
+        Builds a PrecomputedTarget (bf16-stored target_p) outside the compile
+        graph so the compiled loss kernel sees only fixed-shape inputs across
+        micro-batches. Handles both pruning (t2d set) and no-pruning (t2d=None)
+        configs uniformly.
 
         Expects micro_batch to contain:
             input_ids:          [B, T]       — token IDs
@@ -433,9 +548,9 @@ class FSDPDrafterEngine(FSDPEngine):
             loss_mask:          [B, T]       — which tokens contribute to loss
 
         Returns dict matching Eagle3Model.forward() signature:
-            input_ids, attention_mask, target (LazyTarget), loss_mask, hidden_states
+            input_ids, attention_mask, target (PrecomputedTarget), loss_mask, hidden_states
         """
-        from recipe.drafter_cotraining.eagle3.eagle3_model import compute_lazy_target_padded, padding
+        from recipe.drafter_cotraining.eagle3.eagle3_model import compute_target_p_padded, padding
 
         input_ids = micro_batch["input_ids"]
         hidden_states = micro_batch["hidden_states"]
@@ -458,12 +573,18 @@ class FSDPDrafterEngine(FSDPEngine):
             with torch.no_grad():
                 last_hidden_states = self._verifier_norm(last_hidden_states)
 
-        # Build target for Forward KL loss
         eagle3 = self.module.module if hasattr(self.module, "module") else self.module
-        target = compute_lazy_target_padded(
-            last_hidden_states,
-            self._target_lm_head_weight,
-            eagle3.length,  # TTT length (7)
+
+        # No vocab pruning today — t2d=None falls into the no-pruning branch.
+        # When pruning is added later, surface t2d via _t2d_index.
+        t2d = getattr(self, "_t2d_index", None)
+
+        target = compute_target_p_padded(
+            target_hidden_states=last_hidden_states,
+            target_lm_head_weight=self._target_lm_head_weight,
+            loss_mask=loss_mask,
+            length=eagle3.length,  # TTT length (7)
+            t2d=t2d,
         )
 
         return {

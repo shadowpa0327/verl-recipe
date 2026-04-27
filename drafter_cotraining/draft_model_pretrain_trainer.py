@@ -52,7 +52,7 @@ from verl.utils.device import auto_set_device, is_cuda_available
 from verl.utils.tracking import Tracking
 
 from recipe.drafter_cotraining.controller import DrafterDataController, SampleMeta
-from recipe.drafter_cotraining.fsdp_workers import DrafterPretrainWorker
+from recipe.drafter_cotraining.engine_workers import DrafterPretrainWorker
 
 logger = logging.getLogger(__name__)
 DRAFTER_ROLE = "drafter"

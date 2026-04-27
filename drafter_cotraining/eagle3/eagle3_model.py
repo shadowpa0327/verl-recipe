@@ -19,17 +19,14 @@
 # SOFTWARE.
 
 from dataclasses import dataclass
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
-from recipe.drafter_cotraining.eagle3.ops.loss import (
-    compiled_forward_kl_loss,
-    compiled_forward_kl_loss_from_hs,
-)
+from recipe.drafter_cotraining.eagle3.ops.loss import compiled_forward_kl_loss
 def padding(tensor, left=True):
     """Shift tensor by one position along dim=1 with zero padding.
 
@@ -47,18 +44,22 @@ def padding(tensor, left=True):
 
 @dataclass
 class PrecomputedTarget:
-    """Pre-computed target probabilities (used with vocab pruning)."""
+    """Pre-computed target probabilities for the EAGLE forward-KL loss kernel.
 
-    target_p_padded: torch.Tensor  # (B, T + length, V_draft)
-    position_mask: Optional[torch.Tensor] = None  # (B, T)
+    With vocab pruning (t2d set in compute_target_p_padded):
+        target_p_padded shape: (B, T + length, V_draft)
+        position_mask: (B, T) — subset of loss_mask, only positions whose
+            verifier-argmax token falls in V_draft.
+    Without vocab pruning:
+        target_p_padded shape: (B, T + length, V_full)
+        position_mask: None — loss_mask used directly downstream.
 
+    Stored in bf16 to halve resident memory; loss kernel's `tp * log_p`
+    (log_p in fp32) auto-upcasts so loss arithmetic stays fp32.
+    """
 
-@dataclass
-class LazyTarget:
-    """Deferred target computation to avoid materializing (B, T, V_full)."""
-
-    hidden_states_padded: torch.Tensor  # (B, T + length, D)
-    lm_head_weight: torch.Tensor  # (V_full, D)
+    target_p_padded: torch.Tensor
+    position_mask: Optional[torch.Tensor] = None
 
 
 class Eagle3Model(nn.Module):
@@ -85,7 +86,7 @@ class Eagle3Model(nn.Module):
     def _calculate_loss(
         self,
         hidden_states: torch.Tensor,
-        target: Union[PrecomputedTarget, LazyTarget],
+        target: PrecomputedTarget,
         mask: torch.Tensor,
         idx: int,
         seq_length: int,
@@ -95,14 +96,10 @@ class Eagle3Model(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Compute forward-KL loss and accuracy for one TTT step.
 
-        Both paths pass full (B*T, ...) flat views + valid_idx into the
-        compiled function so torch.compile can fuse index_select with
-        subsequent ops, avoiding separate (N_valid, V) copies outside.
-
-        - PrecomputedTarget (vocab pruning): compiled_forward_kl_loss
-          with pre-computed target probs.
-        - LazyTarget (no pruning): compiled_forward_kl_loss_from_hs
-          computes target softmax inside the compiled graph.
+        Passes full (B*T, ...) flat views + valid_idx into the compiled
+        function so torch.compile can fuse index_select with subsequent ops.
+        target.target_p_padded is sized over V_draft (with pruning) or V_full
+        (no pruning); the kernel doesn't care.
         """
         valid_idx = mask.flatten().nonzero().squeeze(-1)
         if valid_idx.numel() == 0:
@@ -115,44 +112,22 @@ class Eagle3Model(nn.Module):
         torch._dynamo.mark_dynamic(valid_idx, 0)
         hs_flat = hidden_states.reshape(-1, hidden_states.shape[-1])
 
-        if isinstance(target, PrecomputedTarget):
-            target_p_step = target.target_p_padded[:, idx : idx + seq_length, :]
-            tp_flat = target_p_step.reshape(-1, target_p_step.shape[-1])
-            args = (hs_flat, tp_flat, valid_idx, norm_weight, lm_head_weight, norm_eps)
-            if self.gradient_checkpointing and self.training:
-                return torch_checkpoint(
-                    compiled_forward_kl_loss,
-                    *args,
-                    use_reentrant=False,
-                )
-            return compiled_forward_kl_loss(*args)
-        else:
-            # lazy
-            ths_flat = target.hidden_states_padded[:, idx : idx + seq_length, :].reshape(
-                -1, target.lm_head_weight.shape[-1]
+        target_p_step = target.target_p_padded[:, idx : idx + seq_length, :]
+        tp_flat = target_p_step.reshape(-1, target_p_step.shape[-1])
+        args = (hs_flat, tp_flat, valid_idx, norm_weight, lm_head_weight, norm_eps)
+        if self.gradient_checkpointing and self.training:
+            return torch_checkpoint(
+                compiled_forward_kl_loss,
+                *args,
+                use_reentrant=False,
             )
-            args = (
-                hs_flat,
-                ths_flat,
-                valid_idx,
-                norm_weight,
-                lm_head_weight,
-                target.lm_head_weight,
-                norm_eps,
-            )
-            if self.gradient_checkpointing and self.training:
-                return torch_checkpoint(
-                    compiled_forward_kl_loss_from_hs,
-                    *args,
-                    use_reentrant=False,
-                )
-            return compiled_forward_kl_loss_from_hs(*args)
+        return compiled_forward_kl_loss(*args)
 
     def forward(
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
-        target: Union[PrecomputedTarget, LazyTarget],
+        target: PrecomputedTarget,
         loss_mask: torch.Tensor,
         hidden_states: torch.Tensor,
         past_key_values: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
@@ -261,46 +236,48 @@ class Eagle3Model(nn.Module):
 def compute_target_p_padded(
     target_hidden_states: torch.Tensor,
     target_lm_head_weight: torch.Tensor,
-    t2d: torch.Tensor,
     loss_mask: torch.Tensor,
     length: int,
+    t2d: Optional[torch.Tensor] = None,
     chunk_size: int = 4096,
 ) -> PrecomputedTarget:
+    """Build target probabilities for the EAGLE forward-KL loss kernel.
+
+    With pruning (t2d not None):
+        - lm_head projects to V_draft
+        - position_mask filters loss_mask further to positions whose
+          verifier-argmax token falls in V_draft.
+    Without pruning (t2d is None):
+        - lm_head projects to V_full
+        - position_mask is None; loss_mask is used directly downstream.
+
+    target_p is stored in bf16 to halve resident memory; the loss kernel's
+    `tp * log_p` (log_p in fp32) auto-upcasts so loss arithmetic stays fp32.
+    """
     target_lm_head_weight = target_lm_head_weight.detach()
-    pruned_weight = target_lm_head_weight[t2d]  # (V_draft, D)
 
-    B, T, _D = target_hidden_states.shape
-    loss_mask_bool = loss_mask.bool()
+    if t2d is not None:
+        pruned_weight = target_lm_head_weight[t2d]  # (V_draft, D)
 
-    valid_flat_idx = loss_mask_bool.reshape(-1).nonzero(as_tuple=True)[0]
-    valid_hs = target_hidden_states.reshape(-1, _D)[valid_flat_idx]  # (N_valid, D)
+        B, T, _D = target_hidden_states.shape
+        loss_mask_bool = loss_mask.bool()
+        valid_flat_idx = loss_mask_bool.reshape(-1).nonzero(as_tuple=True)[0]
+        valid_hs = target_hidden_states.reshape(-1, _D)[valid_flat_idx]  # (N_valid, D)
 
-    position_mask_flat = torch.zeros(B * T, device=target_hidden_states.device, dtype=torch.float)
-    for i in range(0, valid_hs.shape[0], chunk_size):
-        chunk_hs = valid_hs[i : i + chunk_size]
-        chunk_argmax = F.linear(chunk_hs, target_lm_head_weight).argmax(-1)
-        in_draft = t2d[chunk_argmax]
-        position_mask_flat[valid_flat_idx[i : i + chunk_size]] = in_draft.float()
-    position_mask = position_mask_flat.reshape(B, T)
+        position_mask_flat = torch.zeros(B * T, device=target_hidden_states.device, dtype=torch.float)
+        for i in range(0, valid_hs.shape[0], chunk_size):
+            chunk_hs = valid_hs[i : i + chunk_size]
+            chunk_argmax = F.linear(chunk_hs, target_lm_head_weight).argmax(-1)
+            in_draft = t2d[chunk_argmax]
+            position_mask_flat[valid_flat_idx[i : i + chunk_size]] = in_draft.float()
+        position_mask = position_mask_flat.reshape(B, T)
 
-    target_logits_pruned = F.linear(target_hidden_states, pruned_weight)
-    target_p = F.softmax(target_logits_pruned.float(), dim=-1)
+        target_logits = F.linear(target_hidden_states, pruned_weight)
+    else:
+        target_logits = F.linear(target_hidden_states, target_lm_head_weight)
+        position_mask = None
+
+    target_p = F.softmax(target_logits.float(), dim=-1).to(torch.bfloat16)
     target_p_padded = F.pad(target_p, (0, 0, 0, length), value=0.0)
 
     return PrecomputedTarget(target_p_padded, position_mask)
-
-
-def compute_lazy_target_padded(
-    target_hidden_states: torch.Tensor,
-    target_lm_head_weight: torch.Tensor,
-    length: int,
-) -> LazyTarget:
-    """Build a LazyTarget that defers softmax to the forward loop.
-
-    Used for non-pruning cases to avoid materializing the full
-    (B, T, V_full) target probability tensor.
-    """
-    return LazyTarget(
-        hidden_states_padded=F.pad(target_hidden_states, (0, 0, 0, length), value=0.0),
-        lm_head_weight=target_lm_head_weight.detach(),
-    )

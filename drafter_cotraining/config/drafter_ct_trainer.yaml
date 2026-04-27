@@ -170,20 +170,27 @@ actor_rollout_ref:
     # FSDP engine config — keys here match FSDPEngineConfig fields. Defaults are
     # sensible for a tiny draft model on 2+ GPUs. Override from CLI if needed.
     engine_config:
-      # FSDP1 with use_orig_params=True:
-      #  - Params stay as regular Tensors (not DTensor), so the Eagle3 loss
-      #    kernel's F.linear(input, draft_lm_head_weight) doesn't hit the
-      #    "mixed torch.Tensor and DTensor" runtime error.
-      #  - use_orig_params=True lifts FSDP1's "uniform requires_grad" restriction,
-      #    so the frozen embed_tokens + trainable fc/midlayer/norm/lm_head mix
-      #    flattens cleanly.
-      strategy: fsdp
-      use_orig_params: True
+      # FSDP2 with selective wrap (TorchSpec-style): only LlamaDecoderLayer
+      # gets its own FSDP unit; lm_head/norm/fc/embed_tokens stay in the root
+      # unit so they remain gathered through backward (auto-root-detect sets
+      # the root's effective reshard_after_forward=False). The override lives
+      # in FSDPDrafterEngine._build_fsdp_module — see drafter_engine.py.
+      # Without this override, verl's default apply_fsdp2 would wrap lm_head as
+      # its own sub-unit (when tie_word_embeddings=False, e.g. Qwen3-8B), which
+      # would cause the compiled loss kernel to see a non-gathered DTensor.
+      strategy: fsdp2
       fsdp_size: -1
       # Draft model is tiny; keep on GPU to avoid offload overhead dominating.
       param_offload: False
       optimizer_offload: False
       use_remove_padding: False
+
+      # Per-GPU micro-batch size for update_drafter accumulation. Total samples
+      # per macro-step is data.train_batch_size; accumulation_steps =
+      # ceil(B_per_rank / micro_batch_size_per_gpu). micro_size=1 minimizes peak
+      # resident memory for target_p_padded; raise it for fewer accumulation
+      # steps when memory permits.
+      micro_batch_size_per_gpu: 1
 
     # FSDP optimizer config — keys match FSDPOptimizerConfig. total_training_steps
     # must be set at runtime (e.g. to micro.max_steps in the training smoke) or
