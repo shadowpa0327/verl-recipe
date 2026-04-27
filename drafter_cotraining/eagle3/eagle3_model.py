@@ -138,8 +138,9 @@ class Eagle3Model(nn.Module):
             total = sum(p.reshape(-1)[0] for p in self.parameters() if p.requires_grad)
             zero = total * 0.0
             return zero, zero.detach()
-        # Important as it prevents recompilation.
-        torch._dynamo.mark_dynamic(valid_idx, 0)
+        # Soft hint to Dynamo that valid_idx.shape[0] may vary across calls.
+        # Unlike mark_dynamic, this won't error if Dynamo proves the dimension is constant.
+        torch._dynamo.maybe_mark_dynamic(valid_idx, 0)
         hs_flat = hidden_states.reshape(-1, hidden_states.shape[-1])
 
         if isinstance(target, PrecomputedTarget):

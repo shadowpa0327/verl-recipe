@@ -538,6 +538,48 @@ for _name, _vidx in _make_mask_patterns(TestValidIdxSubsettingLazy.BT):
     setattr(TestValidIdxSubsettingLazy, f"test_forward_kl_lazy_{_name}", _make_lazy())
 
 
+class TestValidIdxDynamicShape(unittest.TestCase):
+    """Verify compiled loss kernels accept changing valid_idx lengths."""
+
+    def test_compiled_forward_kl_loss_changing_valid_idx_lengths(self):
+        """compiled_forward_kl_loss should work with changing valid_idx.shape[0]."""
+        torch._dynamo.reset()
+        BT, H, V = 4096, 128, 256
+        hs_flat = torch.randn(BT, H, dtype=torch.bfloat16)
+        norm_weight = torch.randn(H, dtype=torch.bfloat16)
+        lm_head_weight = torch.randn(V, H, dtype=torch.bfloat16)
+        tp_flat = F.softmax(torch.randn(BT, V), dim=-1)
+
+        for n in [BT, BT - 1, BT // 2, 1]:
+            valid_idx = torch.arange(n)
+            torch._dynamo.maybe_mark_dynamic(valid_idx, 0)
+            loss, acc = compiled_forward_kl_loss(
+                hs_flat, tp_flat, valid_idx, norm_weight, lm_head_weight, 1e-6
+            )
+            self.assertTrue(torch.isfinite(loss))
+            self.assertTrue(torch.isfinite(acc))
+
+    def test_compiled_forward_kl_loss_from_hs_changing_valid_idx_lengths(self):
+        """compiled_forward_kl_loss_from_hs should work with changing valid_idx.shape[0]."""
+        torch._dynamo.reset()
+        BT, H, V = 4096, 128, 256
+        hs_flat = torch.randn(BT, H, dtype=torch.bfloat16)
+        ths_flat = torch.randn(BT, H, dtype=torch.bfloat16)
+        norm_weight = torch.randn(H, dtype=torch.bfloat16)
+        lm_head_weight = torch.randn(V, H, dtype=torch.bfloat16)
+        target_lm_head_weight = torch.randn(V, H, dtype=torch.bfloat16)
+
+        for n in [BT, BT - 1, BT // 2, 1]:
+            valid_idx = torch.arange(n)
+            torch._dynamo.maybe_mark_dynamic(valid_idx, 0)
+            loss, acc = compiled_forward_kl_loss_from_hs(
+                hs_flat, ths_flat, valid_idx, norm_weight,
+                lm_head_weight, target_lm_head_weight, 1e-6
+            )
+            self.assertTrue(torch.isfinite(loss))
+            self.assertTrue(torch.isfinite(acc))
+
+
 class TestEagle3ModelLazyDispatch(unittest.TestCase):
     """End-to-end Eagle3Model.forward should dispatch to the lazy kernel when
     target is a LazyTarget, and produce finite plosses + acces of the right
