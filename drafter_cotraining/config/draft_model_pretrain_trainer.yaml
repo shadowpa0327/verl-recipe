@@ -235,6 +235,15 @@ actor_rollout_ref:
     # Optional TrainingWorker loss hook. update_drafter computes the EAGLE loss directly.
     loss_fn: null
 
+    # Optional pretrained drafter checkpoint directory — the ``huggingface/``
+    # layout written by ``FSDPDrafterEngine.save_checkpoint``
+    # (config.json + model.safetensors). When set, the draft weights load
+    # from here via ``AutoEagle3DraftModel.from_pretrained`` instead of
+    # random init. ``embed_tokens`` is then refreshed from
+    # ``model_config.target_model_path`` so the drafter's frozen embedding
+    # always matches the verifier.
+    model_path: null
+
     # Draft model config.
     model_config:
 

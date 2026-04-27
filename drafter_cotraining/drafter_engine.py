@@ -88,6 +88,24 @@ class DrafterModelConfig(BaseConfig):
     # Matches TorchSpec's eagle3_trainer load pattern.
     target_model_path: Optional[str] = None
 
+    # Optional pretrained drafter weights — an HF-format directory matching
+    # the ``huggingface/`` layout written by ``save_checkpoint`` (config.json
+    # + model.safetensors). When set, ``_build_module`` instantiates the
+    # draft via ``AutoEagle3DraftModel.from_pretrained`` instead of random
+    # init / ``from_config``. ``embed_tokens`` is then refreshed from
+    # ``target_model_path`` so the drafter's frozen embedding stays in
+    # lockstep with the verifier.
+    #
+    # This is an INIT-time knob and is orthogonal to the FSDP-sharded resume
+    # path (``checkpoint_config.load_contents`` + ``load_checkpoint``):
+    #   - ``model_path`` runs PRE-FSDP-wrap, before training starts.
+    #   - ``load_checkpoint`` runs POST-FSDP-wrap from the
+    #     ``model_world_size_*_rank_*.pt`` shards written by
+    #     ``FSDPCheckpointManager.save_checkpoint``.
+    # If both are configured for the same run, the sharded resume overwrites
+    # the pretrained init — which is what you want when continuing a run.
+    model_path: Optional[str] = None
+
     # Fields accessed by FSDPEngine — stubbed so the parent __init__ works.
     use_remove_padding: bool = False
     lora_rank: int = 0
@@ -210,6 +228,7 @@ class FSDPDrafterEngine(FSDPEngine):
 
         target_path = getattr(self.model_config, "target_model_path", None)
         local_path = self.model_config.local_path
+        model_path = getattr(self.model_config, "model_path", None)
         assert target_path, (
             "drafter.model_config.target_model_path must be set so the draft "
             "architecture can be auto-derived from the target model. "
@@ -217,15 +236,31 @@ class FSDPDrafterEngine(FSDPEngine):
             "non-Llama architectures.)"
         )
 
-        # Auto-derive draft architecture from the target's HF AutoConfig.
-        # local_path is an optional template overlay — see auto.py.
-        draft_config = AutoDraftModelConfig.from_target(target_path, template_path=local_path)
         attention_backend = getattr(self.model_config, "attention_backend", "flex_attention")
-        draft_model = AutoEagle3DraftModel.from_config(
-            draft_config,
-            torch_dtype=getattr(torch, self.model_config.dtype, torch.bfloat16),
-            attention_backend=attention_backend,
-        )
+        dtype = getattr(torch, self.model_config.dtype, torch.bfloat16)
+
+        if model_path:
+            # Load pretrained drafter weights from a prior checkpoint directory
+            # (config.json + model.safetensors as written by save_checkpoint).
+            # The architecture is read from that directory's config.json — it
+            # must match the target's auto-derived shape, which is the user's
+            # responsibility (we don't reconcile mismatched shapes here).
+            draft_model = AutoEagle3DraftModel.from_pretrained(
+                model_path,
+                torch_dtype=dtype,
+                attention_backend=attention_backend,
+            )
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            logger.info("[rank %d] Loaded pretrained drafter from %s", rank, model_path)
+        else:
+            # Auto-derive draft architecture from the target's HF AutoConfig.
+            # local_path is an optional template overlay — see auto.py.
+            draft_config = AutoDraftModelConfig.from_target(target_path, template_path=local_path)
+            draft_model = AutoEagle3DraftModel.from_config(
+                draft_config,
+                torch_dtype=dtype,
+                attention_backend=attention_backend,
+            )
 
         # Every rank loads embed_tokens from the target checkpoint. We do this
         # pre-wrap on every rank for simplicity and as a sanity layer; the

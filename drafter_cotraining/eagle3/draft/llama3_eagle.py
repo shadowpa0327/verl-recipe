@@ -2133,6 +2133,14 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
             self.register_buffer("t2d", torch.ones(self.target_vocab_size, dtype=torch.bool))
             self.register_buffer("d2t", torch.zeros(self.vocab_size, dtype=torch.int64))
 
+        # Required by transformers 5.x: populates ``self.all_tied_weights_keys``
+        # (an empty dict here since ``tie_word_embeddings=False``). Without it,
+        # ``from_pretrained``'s ``_finalize_model_loading`` AttributeErrors. Also
+        # runs ``init_weights()`` which normal_-inits Linear/Embedding from the
+        # config's ``initializer_range``; for ``from_pretrained`` the loaded
+        # state_dict overwrites this.
+        self.post_init()
+
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 

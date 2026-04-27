@@ -143,6 +143,14 @@ actor_rollout_ref:
     # going through the TrainingWorker.train_batch path.
     loss_fn: null
 
+    # Optional pretrained drafter checkpoint directory — the ``huggingface/``
+    # layout written by ``FSDPDrafterEngine.save_checkpoint`` (config.json +
+    # model.safetensors). When set, the draft weights load from here via
+    # ``AutoEagle3DraftModel.from_pretrained`` instead of random init.
+    # ``embed_tokens`` is then refreshed from ``model_config.target_model_path``
+    # so the drafter's frozen embedding always matches the verifier.
+    model_path: null
+
     # Drafter model config — converted to DrafterModelConfig dataclass in _init_drafter.
     model_config:
       # OPTIONAL template overlay for the draft architecture. When null

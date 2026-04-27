@@ -103,11 +103,28 @@ class ActorRolloutRefDrafterWorker(ActorRolloutRefWorker):
             build_drafter_subconfig,
         )
 
+        from omegaconf import DictConfig, OmegaConf
+
         drafter_cfg = self.config.drafter
+
+        # Surface the top-level ``drafter.model_path`` (pretrained drafter
+        # checkpoint dir) into the nested ``model_config`` dict so the
+        # DrafterModelConfig dataclass picks it up. The top-level location
+        # mirrors how users naturally write the knob in YAML/CLI overrides;
+        # the engine reads it as ``model_config.model_path`` internally.
+        raw_model_cfg = drafter_cfg.get("model_config", {}) or {}
+        if isinstance(raw_model_cfg, DictConfig):
+            raw_model_cfg = OmegaConf.to_container(raw_model_cfg, resolve=True)
+        else:
+            raw_model_cfg = dict(raw_model_cfg)
+        top_level_model_path = drafter_cfg.get("model_path", None)
+        if top_level_model_path is not None and "model_path" not in raw_model_cfg:
+            raw_model_cfg["model_path"] = top_level_model_path
+
         drafter_training_config = TrainingWorkerConfig(
             model_type="drafter_model",
             model_config=build_drafter_subconfig(
-                drafter_cfg.get("model_config", {}), DrafterModelConfig
+                raw_model_cfg, DrafterModelConfig
             ),
             engine_config=build_drafter_subconfig(
                 drafter_cfg.get("engine_config", {}), FSDPEngineConfig
