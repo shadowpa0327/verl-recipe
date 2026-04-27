@@ -53,6 +53,9 @@ class WrappedFlexAttention:
         return self._compiled_flex_attention
 
 
+_compiled_create_block_mask = torch.compile(create_block_mask)
+
+
 def compile_friendly_flex_attention(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -72,8 +75,14 @@ def compile_friendly_create_block_mask(
     Q_LEN,
     KV_LEN,
     device,
+    **kwargs,
 ):
-    return create_block_mask(mask_mod, B, H, Q_LEN, KV_LEN, device)
+    # Compiling create_block_mask replaces the dense (B, H, Q_LEN, KV_LEN) boolean
+    # intermediate with block-wise Triton evaluation: ~6000x less peak memory and
+    # ~9x faster at training shapes than the default Python path.
+    # See claude_docs/eagle3-block-mask-memory-diagnosis.md.
+    fn = _compiled_create_block_mask if not is_torchdynamo_compiling() else create_block_mask
+    return fn(mask_mod, B, H, Q_LEN, KV_LEN, device, **kwargs)
 
 
 def generate_eagle3_mask(seq_lengths: torch.Tensor, Q_LEN: int, KV_LEN: int, lck: int = 0):

@@ -1014,7 +1014,7 @@ def _get_block_sparse(
 
     raw_key = (q_len, kv_len, block_size, device_idx)
     if raw_key not in _block_mask_raw_cache:
-        bm = create_block_mask(
+        bm = compile_friendly_create_block_mask(
             mask_mod_flex,
             B=1,
             H=1,
@@ -1422,13 +1422,15 @@ class LlamaFlexAttention(LlamaAttention):
         # Shrink the attention mask to align with the padding to the right.
         # This is equivalent to the shrinking logic in eagle3.py
         seq_lengths -= lck
-        # TODO: Remove the usage of uncompiled create_block_mask after
+        # create_block_mask always goes through the compiled wrapper now: the
+        # dense (B, H, Q_LEN, KV_LEN) intermediate it avoids dominates memory at
+        # every q_len. See claude_docs/eagle3-block-mask-memory-diagnosis.md.
+        create_block_mask_func = compile_friendly_create_block_mask
+        # TODO: Remove the usage of uncompiled flex_attention after
         # https://github.com/pytorch/pytorch/issues/160018
         if q_len <= 128:
-            create_block_mask_func = create_block_mask
             flex_attention_func = flex_attention
         else:
-            create_block_mask_func = compile_friendly_create_block_mask
             flex_attention_func = compile_friendly_flex_attention
 
         block_mask = create_block_mask_func(
