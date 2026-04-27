@@ -70,6 +70,16 @@ class DrafterModelConfig(BaseConfig):
     ttt_length: int = 7
     attention_backend: str = "flex_attention"
 
+    # Use the lazy forward-KL kernel (compute target probs inside the compiled
+    # graph) instead of the default precomputed-bf16 path. Only meaningful when
+    # vocab pruning is OFF — saves the resident ``(B, T+L, V_full) × 2 B``
+    # tensor at the cost of a per-TTT-step ``(N_valid, V_full)`` softmax.
+    # The lazy path defends against autograd-graph leakage with a triple
+    # ``.detach()`` (factory + kernel) so it stays safe under FSDP2
+    # micro-batch accumulation. See ``LazyTarget vs Precomputed Memory
+    # Analysis.md`` for the memory crossover.
+    enable_lazy_target: bool = False
+
     # Path to the target (verifier) model — a HF repo id or local dir. We load
     # three frozen weights from here at drafter init:
     #   embed_tokens.weight      → draft_model.embed_tokens  (FSDP2-broadcast via fsdp2_load_full_state_dict)
@@ -550,7 +560,11 @@ class FSDPDrafterEngine(FSDPEngine):
         Returns dict matching Eagle3Model.forward() signature:
             input_ids, attention_mask, target (PrecomputedTarget), loss_mask, hidden_states
         """
-        from recipe.drafter_cotraining.eagle3.eagle3_model import compute_target_p_padded, padding
+        from recipe.drafter_cotraining.eagle3.eagle3_model import (
+            compute_lazy_target_padded,
+            compute_target_p_padded,
+            padding,
+        )
 
         input_ids = micro_batch["input_ids"]
         hidden_states = micro_batch["hidden_states"]
@@ -579,13 +593,23 @@ class FSDPDrafterEngine(FSDPEngine):
         # When pruning is added later, surface t2d via _t2d_index.
         t2d = getattr(self, "_t2d_index", None)
 
-        target = compute_target_p_padded(
-            target_hidden_states=last_hidden_states,
-            target_lm_head_weight=self._target_lm_head_weight,
-            loss_mask=loss_mask,
-            length=eagle3.length,  # TTT length (7)
-            t2d=t2d,
-        )
+        # Lazy target builder is only meaningful in the no-pruning regime; the
+        # whole point of pruning is the V_draft projection, so keep the
+        # precomputed path whenever t2d is set even if the flag is on.
+        if getattr(self.model_config, "enable_lazy_target", False) and t2d is None:
+            target = compute_lazy_target_padded(
+                target_hidden_states=last_hidden_states,
+                target_lm_head_weight=self._target_lm_head_weight,
+                length=eagle3.length,  # TTT length (7)
+            )
+        else:
+            target = compute_target_p_padded(
+                target_hidden_states=last_hidden_states,
+                target_lm_head_weight=self._target_lm_head_weight,
+                loss_mask=loss_mask,
+                length=eagle3.length,  # TTT length (7)
+                t2d=t2d,
+            )
 
         return {
             "input_ids": input_ids,

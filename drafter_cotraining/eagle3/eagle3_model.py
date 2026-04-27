@@ -19,14 +19,17 @@
 # SOFTWARE.
 
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
-from recipe.drafter_cotraining.eagle3.ops.loss import compiled_forward_kl_loss
+from recipe.drafter_cotraining.eagle3.ops.loss import (
+    compiled_forward_kl_loss,
+    compiled_forward_kl_loss_from_hs,
+)
 def padding(tensor, left=True):
     """Shift tensor by one position along dim=1 with zero padding.
 
@@ -62,6 +65,29 @@ class PrecomputedTarget:
     position_mask: Optional[torch.Tensor] = None
 
 
+@dataclass
+class LazyTarget:
+    """Deferred target distribution for the EAGLE forward-KL loss kernel.
+
+    Holds the verifier hidden-states and lm_head weight only; the softmax
+    over V_full is computed inside ``compiled_forward_kl_loss_from_hs`` per
+    TTT step rather than materialized as a (B, T+length, V_full) resident
+    tensor. Trades resident memory for per-step compute — see
+    ``LazyTarget vs Precomputed Memory Analysis.md`` for the crossover.
+
+    Both fields are detached at factory time (``compute_lazy_target_padded``)
+    and again inside the compiled kernel as a belt-and-suspenders defense
+    against accidental grad-graph leakage under FSDP micro-batching.
+
+    Note: incompatible with vocab pruning — when ``t2d`` is set, use
+    ``PrecomputedTarget`` instead (V_draft is small, so the resident tensor
+    is cheap and pruning's whole point is the V_draft projection).
+    """
+
+    hidden_states_padded: torch.Tensor  # (B, T + length, D), bf16
+    lm_head_weight: torch.Tensor  # (V_full, D), bf16
+
+
 class Eagle3Model(nn.Module):
     def __init__(
         self,
@@ -86,7 +112,7 @@ class Eagle3Model(nn.Module):
     def _calculate_loss(
         self,
         hidden_states: torch.Tensor,
-        target: PrecomputedTarget,
+        target: Union[PrecomputedTarget, LazyTarget],
         mask: torch.Tensor,
         idx: int,
         seq_length: int,
@@ -98,8 +124,12 @@ class Eagle3Model(nn.Module):
 
         Passes full (B*T, ...) flat views + valid_idx into the compiled
         function so torch.compile can fuse index_select with subsequent ops.
-        target.target_p_padded is sized over V_draft (with pruning) or V_full
-        (no pruning); the kernel doesn't care.
+
+        - PrecomputedTarget: target_p sized over V_draft (pruning) or V_full
+          (no pruning); kernel takes a pre-built ``target_p_flat``.
+        - LazyTarget: target_p computed inside the compiled graph from
+          ``target_hidden_states_flat`` and the (frozen) verifier lm_head;
+          saves the resident (B, T+length, V) tensor.
         """
         valid_idx = mask.flatten().nonzero().squeeze(-1)
         if valid_idx.numel() == 0:
@@ -112,22 +142,43 @@ class Eagle3Model(nn.Module):
         torch._dynamo.mark_dynamic(valid_idx, 0)
         hs_flat = hidden_states.reshape(-1, hidden_states.shape[-1])
 
-        target_p_step = target.target_p_padded[:, idx : idx + seq_length, :]
-        tp_flat = target_p_step.reshape(-1, target_p_step.shape[-1])
-        args = (hs_flat, tp_flat, valid_idx, norm_weight, lm_head_weight, norm_eps)
+        if isinstance(target, PrecomputedTarget):
+            target_p_step = target.target_p_padded[:, idx : idx + seq_length, :]
+            tp_flat = target_p_step.reshape(-1, target_p_step.shape[-1])
+            args = (hs_flat, tp_flat, valid_idx, norm_weight, lm_head_weight, norm_eps)
+            if self.gradient_checkpointing and self.training:
+                return torch_checkpoint(
+                    compiled_forward_kl_loss,
+                    *args,
+                    use_reentrant=False,
+                )
+            return compiled_forward_kl_loss(*args)
+
+        # LazyTarget — compute the target softmax inside the compiled kernel.
+        ths_step = target.hidden_states_padded[:, idx : idx + seq_length, :]
+        ths_flat = ths_step.reshape(-1, target.lm_head_weight.shape[-1])
+        args = (
+            hs_flat,
+            ths_flat,
+            valid_idx,
+            norm_weight,
+            lm_head_weight,
+            target.lm_head_weight,
+            norm_eps,
+        )
         if self.gradient_checkpointing and self.training:
             return torch_checkpoint(
-                compiled_forward_kl_loss,
+                compiled_forward_kl_loss_from_hs,
                 *args,
                 use_reentrant=False,
             )
-        return compiled_forward_kl_loss(*args)
+        return compiled_forward_kl_loss_from_hs(*args)
 
     def forward(
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
-        target: PrecomputedTarget,
+        target: Union[PrecomputedTarget, LazyTarget],
         loss_mask: torch.Tensor,
         hidden_states: torch.Tensor,
         past_key_values: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
@@ -281,3 +332,31 @@ def compute_target_p_padded(
     target_p_padded = F.pad(target_p, (0, 0, 0, length), value=0.0)
 
     return PrecomputedTarget(target_p_padded, position_mask)
+
+
+@torch.no_grad()
+def compute_lazy_target_padded(
+    target_hidden_states: torch.Tensor,
+    target_lm_head_weight: torch.Tensor,
+    length: int,
+) -> LazyTarget:
+    """Build a LazyTarget that defers softmax to the loss kernel.
+
+    Used for the no-pruning regime to avoid materializing
+    ``(B, T + length, V_full)`` resident; per-step transient is
+    ``(N_valid, V_full)`` instead.
+
+    Hardened against grad-graph leakage: ``@torch.no_grad()`` plus an
+    explicit ``.detach()`` on both the padded HS and the lm_head weight.
+    The compiled kernel ``compiled_forward_kl_loss_from_hs`` repeats the
+    detach on its target inputs as belt-and-suspenders. Three layers
+    matter because lazy is only safe under FSDP micro-batching when the
+    target side is fully outside the autograd graph (see hazards #1 and
+    #3 in ``Loss Kernel Choice — Lazy vs Precomputed.md``).
+    """
+    return LazyTarget(
+        hidden_states_padded=F.pad(
+            target_hidden_states, (0, 0, 0, length), value=0.0
+        ).detach(),
+        lm_head_weight=target_lm_head_weight.detach(),
+    )

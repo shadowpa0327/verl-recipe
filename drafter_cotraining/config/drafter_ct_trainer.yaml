@@ -166,6 +166,13 @@ actor_rollout_ref:
       # the safetensors / HF snapshot, dist.broadcast handles the rest).
       # Defaults to actor_rollout_ref.model.path so drafter and actor agree.
       target_model_path: ${actor_rollout_ref.model.path}
+      # Compute target_p inside the compiled loss graph (LazyTarget path)
+      # instead of materializing (B, T+L, V_full) in advance. No-op when
+      # vocab pruning is on; otherwise saves the resident target_p tensor
+      # at the cost of a per-TTT-step full-vocab softmax. Safe under
+      # FSDP2 micro-batching — kernel detaches both target inputs inside
+      # the compiled region and the factory is @torch.no_grad() + .detach().
+      enable_lazy_target: false
 
     # FSDP engine config — keys here match FSDPEngineConfig fields. Defaults are
     # sensible for a tiny draft model on 2+ GPUs. Override from CLI if needed.

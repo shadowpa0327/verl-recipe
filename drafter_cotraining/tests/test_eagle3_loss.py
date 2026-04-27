@@ -17,10 +17,15 @@ from transformers.models.llama.configuration_llama import LlamaConfig
 from recipe.drafter_cotraining.eagle3.draft.llama3_eagle import LlamaForCausalLMEagle3
 from recipe.drafter_cotraining.eagle3.eagle3_model import (
     Eagle3Model,
+    LazyTarget,
     PrecomputedTarget,
+    compute_lazy_target_padded,
     compute_target_p_padded,
 )
-from recipe.drafter_cotraining.eagle3.ops.loss import compiled_forward_kl_loss
+from recipe.drafter_cotraining.eagle3.ops.loss import (
+    compiled_forward_kl_loss,
+    compiled_forward_kl_loss_from_hs,
+)
 
 
 def _reference_forward_kl_loss(hs_flat, target_p_flat, norm_weight, lm_head_weight, norm_eps):
@@ -363,6 +368,208 @@ for _name, _vidx in _make_mask_patterns(TestValidIdxSubsetting.BT):
         return test
 
     setattr(TestValidIdxSubsetting, f"test_forward_kl_{_name}", _make_kl())
+
+
+class TestComputeLazyTargetPadded(unittest.TestCase):
+    """compute_lazy_target_padded: shape, dtype, detach correctness."""
+
+    def test_shapes_and_padding(self):
+        torch.manual_seed(0)
+        B, T, D, V = 2, 16, 64, 512
+        length = 7
+        hs = torch.randn(B, T, D, dtype=torch.bfloat16)
+        weight = torch.randn(V, D, dtype=torch.bfloat16)
+
+        result = compute_lazy_target_padded(
+            target_hidden_states=hs,
+            target_lm_head_weight=weight,
+            length=length,
+        )
+
+        self.assertIsInstance(result, LazyTarget)
+        self.assertEqual(result.hidden_states_padded.shape, (B, T + length, D))
+        self.assertEqual(result.lm_head_weight.shape, (V, D))
+        self.assertEqual(result.hidden_states_padded.dtype, torch.bfloat16)
+        # Padding region is exactly zero (lazy expects zero-init padding so it
+        # round-trips through the kernel cleanly when valid_idx skips it).
+        torch.testing.assert_close(
+            result.hidden_states_padded[:, T:, :],
+            torch.zeros(B, length, D, dtype=torch.bfloat16),
+        )
+
+    def test_no_grad_lineage_even_when_inputs_require_grad(self):
+        """Even if a future caller passes grad-tracked inputs, the output must
+        be detached so the compiled lazy kernel never builds an autograd
+        graph through the target side."""
+        torch.manual_seed(0)
+        B, T, D, V = 1, 8, 32, 64
+        # Mark inputs as grad-tracked to simulate a regression where someone
+        # forgot to .detach() upstream.
+        hs = torch.randn(B, T, D, dtype=torch.float32, requires_grad=True)
+        weight = torch.randn(V, D, dtype=torch.float32, requires_grad=True)
+
+        result = compute_lazy_target_padded(
+            target_hidden_states=hs,
+            target_lm_head_weight=weight,
+            length=3,
+        )
+
+        self.assertFalse(result.hidden_states_padded.requires_grad)
+        self.assertFalse(result.lm_head_weight.requires_grad)
+        self.assertIsNone(result.hidden_states_padded.grad_fn)
+        self.assertIsNone(result.lm_head_weight.grad_fn)
+
+
+class TestCompiledForwardKLLossFromHS(unittest.TestCase):
+    """compiled_forward_kl_loss_from_hs (lazy kernel) parity tests."""
+
+    def test_matches_precomputed_path_on_identical_inputs(self):
+        """Both kernels should produce the same loss when given the same
+        (target_hidden_states, target_lm_head_weight) — modulo small float
+        noise from bf16 vs fp32 softmax intermediates and one extra cast."""
+        torch.manual_seed(13)
+        N, H, V = 32, 128, 256
+        hs = torch.randn(N, H, dtype=torch.bfloat16)
+        ths = torch.randn(N, H, dtype=torch.bfloat16)
+        norm_weight = torch.randn(H, dtype=torch.bfloat16)
+        lm_head_weight = torch.randn(V, H, dtype=torch.bfloat16)
+        target_lm_head_weight = torch.randn(V, H, dtype=torch.bfloat16)
+        norm_eps = 1e-6
+        valid_idx = torch.arange(N)
+
+        # Build target_p the same way the precomputed factory does (fp32 softmax,
+        # then bf16-cast to mirror compute_target_p_padded's storage choice).
+        with torch.no_grad():
+            target_logits = F.linear(ths, target_lm_head_weight)
+            target_p = F.softmax(target_logits.float(), dim=-1).to(torch.bfloat16)
+
+        loss_pc, acc_pc = compiled_forward_kl_loss(
+            hs, target_p, valid_idx, norm_weight, lm_head_weight, norm_eps,
+        )
+        loss_lz, acc_lz = compiled_forward_kl_loss_from_hs(
+            hs, ths, valid_idx, norm_weight, lm_head_weight,
+            target_lm_head_weight, norm_eps,
+        )
+
+        # bf16-rounded tp vs fp32-tp inside the kernel introduces ~1e-3 noise.
+        torch.testing.assert_close(loss_lz, loss_pc, atol=5e-3, rtol=5e-3)
+        torch.testing.assert_close(acc_lz, acc_pc, atol=1e-3, rtol=1e-3)
+
+    def test_target_grad_isolation(self):
+        """Backward through the lazy kernel must NOT accumulate grads on the
+        verifier weight or hidden states — the .detach() inside the kernel is
+        the load-bearing defense for FSDP2 micro-batch accumulation."""
+        torch.manual_seed(0)
+        N, H, V = 16, 64, 128
+        hs = torch.randn(N, H, dtype=torch.float32, requires_grad=True)
+        ths = torch.randn(N, H, dtype=torch.float32, requires_grad=True)
+        norm_weight = torch.randn(H, dtype=torch.float32, requires_grad=True)
+        lm_head_weight = torch.randn(V, H, dtype=torch.float32, requires_grad=True)
+        target_lm_head_weight = torch.randn(V, H, dtype=torch.float32, requires_grad=True)
+        norm_eps = 1e-6
+        valid_idx = torch.arange(N)
+
+        loss, _ = compiled_forward_kl_loss_from_hs(
+            hs, ths, valid_idx, norm_weight, lm_head_weight,
+            target_lm_head_weight, norm_eps,
+        )
+        loss.backward()
+
+        # Draft side should have grads.
+        self.assertIsNotNone(hs.grad)
+        self.assertIsNotNone(norm_weight.grad)
+        self.assertIsNotNone(lm_head_weight.grad)
+        self.assertTrue(torch.isfinite(hs.grad).all())
+
+        # Target side must NOT have grads (or must be all zero) thanks to the
+        # in-kernel .detach().
+        self.assertTrue(
+            ths.grad is None or ths.grad.abs().sum().item() == 0.0,
+            f"target hidden states grad should be None/zero, got {ths.grad}",
+        )
+        self.assertTrue(
+            target_lm_head_weight.grad is None
+            or target_lm_head_weight.grad.abs().sum().item() == 0.0,
+            f"target lm_head grad should be None/zero, got {target_lm_head_weight.grad}",
+        )
+
+
+class TestValidIdxSubsettingLazy(unittest.TestCase):
+    """valid_idx filtering must produce the same loss as manual pre-filtering
+    under the lazy kernel too — same property as the precomputed kernel."""
+
+    BT, H, V = 64, 128, 256
+
+    def _check_forward_kl_lazy(self, valid_idx):
+        torch.manual_seed(7)
+        hs_flat = torch.randn(self.BT, self.H, dtype=torch.bfloat16)
+        ths_flat = torch.randn(self.BT, self.H, dtype=torch.bfloat16)
+        norm_weight = torch.randn(self.H, dtype=torch.bfloat16)
+        lm_head_weight = torch.randn(self.V, self.H, dtype=torch.bfloat16)
+        target_lm_head_weight = torch.randn(self.V, self.H, dtype=torch.bfloat16)
+        norm_eps = 1e-6
+
+        loss, acc = compiled_forward_kl_loss_from_hs(
+            hs_flat, ths_flat, valid_idx, norm_weight, lm_head_weight,
+            target_lm_head_weight, norm_eps,
+        )
+
+        hs_valid = hs_flat[valid_idx]
+        ths_valid = ths_flat[valid_idx]
+        all_idx = torch.arange(hs_valid.shape[0])
+        loss_ref, acc_ref = compiled_forward_kl_loss_from_hs(
+            hs_valid, ths_valid, all_idx, norm_weight, lm_head_weight,
+            target_lm_head_weight, norm_eps,
+        )
+
+        torch.testing.assert_close(loss, loss_ref, atol=1e-4, rtol=1e-4)
+        torch.testing.assert_close(acc, acc_ref, atol=1e-4, rtol=1e-4)
+
+
+# Mirror the precomputed-kernel pattern: one test method per mask shape.
+for _name, _vidx in _make_mask_patterns(TestValidIdxSubsettingLazy.BT):
+
+    def _make_lazy(vidx=_vidx):
+        def test(self):
+            self._check_forward_kl_lazy(vidx)
+
+        return test
+
+    setattr(TestValidIdxSubsettingLazy, f"test_forward_kl_lazy_{_name}", _make_lazy())
+
+
+class TestEagle3ModelLazyDispatch(unittest.TestCase):
+    """End-to-end Eagle3Model.forward should dispatch to the lazy kernel when
+    target is a LazyTarget, and produce finite plosses + acces of the right
+    length (matches PrecomputedTarget shape contract)."""
+
+    def test_forward_with_lazy_target(self):
+        torch.manual_seed(0)
+        B, T = 1, 16
+        H, V = 128, 256
+        length = 3
+        config = _make_config(H=H, V=V)
+        model = _make_model(config, length=length)
+
+        batch = _make_batch(B, T, H, V)
+        target = compute_lazy_target_padded(
+            target_hidden_states=batch["target_hidden_states"],
+            target_lm_head_weight=torch.randn(V, H, dtype=torch.bfloat16),
+            length=length,
+        )
+
+        plosses, _, acces = model(
+            input_ids=batch["input_ids"],
+            attention_mask=batch["attention_mask"],
+            target=target,
+            loss_mask=batch["loss_mask"],
+            hidden_states=batch["hidden_states"],
+        )
+
+        self.assertEqual(len(plosses), length)
+        self.assertEqual(len(acces), length)
+        for i, p in enumerate(plosses):
+            self.assertTrue(torch.isfinite(p), f"ploss[{i}] non-finite: {p}")
 
 
 if __name__ == "__main__":

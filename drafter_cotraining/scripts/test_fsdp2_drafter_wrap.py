@@ -46,7 +46,9 @@ sys.path.insert(0, "/root/verl")
 from recipe.drafter_cotraining.eagle3.draft.llama3_eagle import LlamaForCausalLMEagle3  # noqa: E402
 from recipe.drafter_cotraining.eagle3.eagle3_model import (  # noqa: E402
     Eagle3Model,
+    LazyTarget,
     PrecomputedTarget,
+    compute_lazy_target_padded,
     compute_target_p_padded,
 )
 from verl.utils.fsdp_utils import fsdp2_load_full_state_dict  # noqa: E402
@@ -99,9 +101,13 @@ def _selective_fsdp2_wrap(module, mesh, mp_policy, offload_policy):
     return module, sharded
 
 
-def _make_synthetic_batch(device, length, *, seq_len=T_MAX):
-    """Synthetic inputs for one Eagle3Model.forward call."""
-    torch.manual_seed(7)
+def _make_synthetic_batch(device, length, *, seq_len=T_MAX, lazy: bool = False, seed: int = 7):
+    """Synthetic inputs for one Eagle3Model.forward call.
+
+    ``lazy=True`` builds a LazyTarget instead of a PrecomputedTarget so the
+    same fixture exercises both target paths.
+    """
+    torch.manual_seed(seed)
     input_ids = torch.randint(0, V, (B, seq_len), device=device)
     attention_mask = torch.ones(B, seq_len, dtype=torch.long, device=device)
     loss_mask = torch.ones(B, seq_len, device=device)
@@ -109,13 +115,20 @@ def _make_synthetic_batch(device, length, *, seq_len=T_MAX):
     target_hs = torch.randn(B, seq_len, H, device=device, dtype=torch.bfloat16)
     target_lm_head = torch.randn(V, H, device=device, dtype=torch.bfloat16)
 
-    target = compute_target_p_padded(
-        target_hidden_states=target_hs,
-        target_lm_head_weight=target_lm_head,
-        loss_mask=loss_mask,
-        length=length,
-        t2d=None,
-    )
+    if lazy:
+        target = compute_lazy_target_padded(
+            target_hidden_states=target_hs,
+            target_lm_head_weight=target_lm_head,
+            length=length,
+        )
+    else:
+        target = compute_target_p_padded(
+            target_hidden_states=target_hs,
+            target_lm_head_weight=target_lm_head,
+            loss_mask=loss_mask,
+            length=length,
+            t2d=None,
+        )
     return {
         "input_ids": input_ids,
         "attention_mask": attention_mask,
@@ -243,6 +256,113 @@ def test_grad_sync_two_step(model, device, log):
         f"({grad_param_count} trainable params have .grad)")
 
 
+def test_lazy_forward_backward(model, device, log):
+    """[T6] Forward+backward through the LAZY kernel must run cleanly under
+    FSDP2's selective wrap.
+
+    Same canary as T4 but with ``compute_lazy_target_padded`` →
+    ``compiled_forward_kl_loss_from_hs``. The lazy kernel takes the verifier
+    lm_head as a graph input; if .detach() inside the compiled region were
+    missing, this would either trip Tensor×DTensor or accumulate spurious
+    grads on a "frozen" weight.
+    """
+    # Zero any leftover grads from prior tests.
+    for p in model.parameters():
+        if p.grad is not None:
+            p.grad.detach_()
+            p.grad.zero_()
+
+    batch = _make_synthetic_batch(device, length=model.length, lazy=True)
+    assert isinstance(batch["target"], LazyTarget), "fixture must produce LazyTarget"
+    plosses, _, acces = model(**batch)
+    assert len(plosses) == model.length, f"Expected {model.length} TTT losses, got {len(plosses)}"
+    for i, p in enumerate(plosses):
+        assert torch.isfinite(p), f"lazy ploss[{i}] is non-finite: {p}"
+    log(f"forward OK — plosses={[f'{p.item():.3f}' for p in plosses]}")
+
+    loss = sum(plosses) / len(plosses)
+    loss.backward()
+
+    grad_count = 0
+    has_nonzero = False
+    for p in model.parameters():
+        if p.requires_grad and p.grad is not None:
+            grad_count += 1
+            if p.grad.abs().sum() > 0:
+                has_nonzero = True
+    assert has_nonzero, "no non-zero grads after lazy backward"
+    log(f"backward OK — {grad_count} trainable params have grads")
+
+
+def test_lazy_micro_batch_accumulation(model, device, log, num_micro: int = 3):
+    """[T7] Multi-iteration accumulation simulating the production micro-batch
+    loop (engine_workers.py::_drafter_train_step_micro) on the LAZY path.
+
+    For mb_idx in range(num_micro):
+        set_requires_gradient_sync(mb_idx == num_micro - 1)
+        forward(LazyTarget) → weighted backward
+
+    Catches the three lazy-path hazards together:
+      H1: target_lm_head_weight as graph input across mb's (DTensor mismatch).
+      H2: two valid_idx-dependent matmuls + only one mark_dynamic (shape drift).
+      H3: target softmax in autograd graph (spurious grads + reduce-scatter
+          shape mismatch).
+    """
+    # Zero leftover grads.
+    for p in model.parameters():
+        if p.grad is not None:
+            p.grad.detach_()
+            p.grad.zero_()
+
+    sync_states = []
+    for mb_idx in range(num_micro):
+        is_last = mb_idx == num_micro - 1
+        model.set_requires_gradient_sync(is_last)
+        sync_states.append(is_last)
+
+        # Vary the seed across mb's so the synthetic batch and valid_idx counts
+        # differ — this exercises mark_dynamic recompilation guards under the
+        # lazy kernel's two valid_idx-dependent matmuls.
+        batch = _make_synthetic_batch(
+            device, length=model.length, lazy=True, seed=100 + mb_idx,
+        )
+        # Vary loss_mask sparsity across mb's to also drive different N_valid.
+        if mb_idx == 1:
+            batch["loss_mask"] = batch["loss_mask"].clone()
+            batch["loss_mask"][:, : batch["loss_mask"].shape[1] // 2] = 0
+        plosses, _, _ = model(**batch)
+        # Match the production weighting (0.8^i).
+        loss_weights = [0.8 ** i for i in range(len(plosses))]
+        weighted = sum(w * p for w, p in zip(loss_weights, plosses))
+        weighted.backward()
+
+    # After the final sync, .grad should be visible on every trainable param
+    # (DTensors get a partial-replicate placement under FSDP2 → call full_tensor
+    # to verify across replicas).
+    from torch.distributed.tensor import DTensor
+
+    has_nonzero = False
+    grad_count = 0
+    nan_or_inf = []
+    for name, p in model.named_parameters():
+        if not p.requires_grad or p.grad is None:
+            continue
+        grad_count += 1
+        g = p.grad
+        g_full = g.full_tensor() if isinstance(g, DTensor) else g
+        if not torch.isfinite(g_full).all():
+            nan_or_inf.append(name)
+        if g_full.abs().sum().item() > 0:
+            has_nonzero = True
+
+    assert not nan_or_inf, f"non-finite grads on lazy mb-accum: {nan_or_inf[:5]}"
+    assert has_nonzero, "no non-zero grads after lazy mb-accum loop"
+    log(
+        f"OK — lazy accum over {num_micro} mb's (sync states={sync_states}); "
+        f"{grad_count} trainable params have finite, non-zero grads"
+    )
+
+
 # ── Driver ───────────────────────────────────────────────────
 
 
@@ -286,6 +406,8 @@ def main():
         ("T3 param types", test_param_dtype, (model, lambda m: log(f"[T3] {m}"))),
         ("T4 forward+backward", test_forward_backward, (model, device, lambda m: log(f"[T4] {m}"))),
         ("T5 grad-sync two-step", test_grad_sync_two_step, (model, device, lambda m: log(f"[T5] {m}"))),
+        ("T6 lazy forward+backward", test_lazy_forward_backward, (model, device, lambda m: log(f"[T6] {m}"))),
+        ("T7 lazy mb-accumulation", test_lazy_micro_batch_accumulation, (model, device, lambda m: log(f"[T7] {m}"))),
     ]:
         try:
             fn(*args)

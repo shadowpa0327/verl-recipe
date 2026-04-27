@@ -65,3 +65,62 @@ def compiled_forward_kl_loss(
     return loss, acc
 
 
+@torch.compile(dynamic=None)
+def compiled_forward_kl_loss_from_hs(
+    prenorm_hidden_states_flat,
+    target_hidden_states_flat,
+    valid_idx,
+    norm_weight,
+    lm_head_weight,
+    target_lm_head_weight,
+    norm_eps,
+):
+    """torch.compile'd lazy variant: build target probs *inside* the graph.
+
+    Differs from ``compiled_forward_kl_loss`` in that the target distribution
+    is computed from ``target_hidden_states_flat @ target_lm_head_weight`` per
+    call rather than read from a pre-built ``(B*T, V)`` tensor. Saves the
+    resident ``target_p_padded`` tensor at the cost of a per-TTT-step full-vocab
+    projection. Useful when ``V_full`` is large and the loss-mask is sparse —
+    see ``LazyTarget vs Precomputed Memory Analysis.md`` for the crossover.
+
+    Defensive ``.detach()`` calls on the target inputs are belt-and-suspenders:
+    the factory (``compute_lazy_target_padded``) already strips grad lineage,
+    but a future caller could regress that. Detaching here guarantees the
+    target side never participates in autograd, which is the prerequisite for
+    micro-batch FSDP gradient accumulation (see hazards #1 and #3 in
+    ``Loss Kernel Choice — Lazy vs Precomputed.md``).
+
+    Args:
+        prenorm_hidden_states_flat: (B*T, H) — flattened draft hidden states
+        target_hidden_states_flat: (B*T, D) — flattened verifier hidden states
+        valid_idx: (N,) int64 — indices of non-masked positions
+        norm_weight: (H,)
+        lm_head_weight: (V_draft, H) — draft lm_head weight
+        target_lm_head_weight: (V_full, D) — verifier lm_head weight (frozen)
+        norm_eps: float
+    """
+    hs = prenorm_hidden_states_flat.index_select(0, valid_idx)
+    ths = target_hidden_states_flat.index_select(0, valid_idx).detach()
+    target_w = target_lm_head_weight.detach()
+
+    # Target probs (no grad through the target side by construction).
+    tp = F.softmax(F.linear(ths, target_w).float(), dim=-1)
+
+    # RMSNorm
+    hs_f32 = hs.float()
+    variance = hs_f32.pow(2).mean(-1, keepdim=True)
+    rstd = torch.rsqrt(variance + norm_eps)
+    norm_hs = (hs_f32 * rstd).to(hs.dtype) * norm_weight
+
+    logits = F.linear(norm_hs, lm_head_weight)  # (N, V_draft)
+
+    # Forward KL loss
+    log_p = F.log_softmax(logits.float(), dim=-1)
+    loss = -(tp * log_p).sum(-1).mean()
+
+    # Accuracy: argmax in V_draft vs argmax in V_full — only meaningful when
+    # V_draft == V_full (no pruning), which is the lazy path's intended regime.
+    acc = (logits.argmax(-1) == tp.argmax(-1)).float().mean()
+
+    return loss, acc

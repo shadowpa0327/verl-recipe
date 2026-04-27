@@ -253,6 +253,16 @@ actor_rollout_ref:
       # Target verifier model path.
       target_model_path: ${actor_rollout_ref.model.path}
 
+      # Compute target_p inside the compiled loss graph (LazyTarget path)
+      # instead of materializing the (B, T+L, V_full) tensor in advance.
+      # Only meaningful when vocab pruning is off; ignored when pruning is on.
+      # Saves the resident target_p tensor at the cost of a per-TTT-step
+      # full-vocab softmax. Safe under FSDP2 micro-batching: the kernel
+      # detaches both target inputs inside the compiled region, and the
+      # factory is decorated with @torch.no_grad() + .detach() so no autograd
+      # lineage reaches the verifier weights.
+      enable_lazy_target: false
+
     # Drafter FSDP engine config.
     engine_config:
 
