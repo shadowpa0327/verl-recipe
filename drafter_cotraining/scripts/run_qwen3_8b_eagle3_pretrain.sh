@@ -12,10 +12,10 @@ RECIPE_ROOT="$(dirname "$SCRIPT_DIR")"
 VERL_ROOT="$(cd "$RECIPE_ROOT/../.." && pwd)"
 
 # Dataset/model paths. Override with env vars.
-DATA_DIR="${DATA_DIR:-$HOME/data/qwen3_8b_eagle3_10k}"
+DATA_DIR="${DATA_DIR:-/mnt/hdfs/ccchang_hldy/ultrachat_200k_tenyun_regenerate/data_verl_100k_train_1000_test}"
 TRAIN_FILE="${TRAIN_FILE:-$DATA_DIR/train.parquet}"
 VAL_FILE="${VAL_FILE:-$DATA_DIR/test.parquet}"
-MODEL_PATH="${MODEL_PATH:-Qwen/Qwen3-8B}"
+MODEL_PATH="${MODEL_PATH:-/mnt/hdfs/ccchang_hldy/Qwen3-8B}"
 PYTHON_BIN="${PYTHON:-python}"
 ATTENTION_BACKEND="${ATTENTION_BACKEND:-flex_attention}"
 
@@ -46,25 +46,27 @@ cd "$VERL_ROOT"
     --config-name draft_model_pretrain_trainer \
     data.train_files="['$TRAIN_FILE']" \
     data.eval_files="['$VAL_FILE']" \
-    data.train_batch_size=4 \
-    data.val_batch_size=4 \
+    data.train_batch_size=128 \
+    data.val_batch_size=128 \
     data.max_prompt_length=4096 \
     data.max_response_length=2048 \
     actor_rollout_ref.model.path="$MODEL_PATH" \
-    actor_rollout_ref.drafter.optimizer_config.lr=1.0e-4 \
+    actor_rollout_ref.drafter.optimizer_config.lr=1e-4 \
     actor_rollout_ref.drafter.optimizer_config.lr_warmup_steps_ratio=0.015 \
     actor_rollout_ref.drafter.optimizer_config.clip_grad=0.5 \
     actor_rollout_ref.drafter.model_config.attention_backend="$ATTENTION_BACKEND" \
+    actor_rollout_ref.drafter.model_config.enable_lazy_target=True \
+    actor_rollout_ref.drafter.engine_config.micro_batch_size_per_gpu=4 \
     hs_collector.inference.max_model_len=6176 \
-    hs_collector.inference.gpu_memory_utilization=0.3 \
-    hs_collector.inference.engine_kwargs.vllm.speculative_config.draft_model_config.hf_config.eagle_aux_hidden_state_layer_ids='[1,17,32,35]' \
+    hs_collector.inference.gpu_memory_utilization=0.5 \
     pretrain.val_max_batches=-1 \
-    trainer.logger='["console"]' \
-    trainer.n_gpus_per_node=2 \
+    trainer.logger='["console", "wandb"]' \
+    trainer.n_gpus_per_node=8 \
     trainer.nnodes=1 \
-    trainer.save_freq=-1 \
-    trainer.test_freq=-1 \
-    trainer.total_epochs=1 \
-    trainer.total_training_steps=1000 \
+    trainer.save_freq=1000 \
+    trainer.test_freq=500 \
+    trainer.total_epochs=5 \
+    trainer.project_name='ccc_qwen3_8b_eagle3_pretrain' \
+    trainer.experiment_name='qwen3_8b_ultrachat200kTY_100k_train_1000_test_bs128_aux_fix_dp_fix' \
     trainer.val_before_train=false \
     "$@"

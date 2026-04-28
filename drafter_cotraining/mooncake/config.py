@@ -50,8 +50,8 @@ class MooncakeConfig:
     local_hostname: str = "localhost"
     metadata_server: str = "http://localhost:8090/metadata"
     master_server_address: str = "localhost:50051"
-    global_segment_size: str | int = 4 * 1024 * 1024 * 1024
-    local_buffer_size: str | int = 512 * 1024 * 1024
+    global_segment_size: str | int = 32 * 1024 * 1024 * 1024
+    local_buffer_size: str | int = 2 * 1024 * 1024 * 1024
     protocol: str = "tcp"
     device_name: str = ""
     gpu_buffer_size: str | int | None = None

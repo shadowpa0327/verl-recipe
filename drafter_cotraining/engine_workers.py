@@ -577,7 +577,9 @@ class ActorRolloutRefDrafterWorker(ActorRolloutRefWorker):
 
         # Exact mean divisor: Σ_k (mb_valid_k / total_valid_global) · per_pos_mean_k
         # = (1 / total_valid_global) · Σ_k Σ_pos per_pos_loss = mean over total valid.
-        scale = mb_valid / total_valid_global
+        # Multiply by dp_size to cancel FSDP/DDP gradient averaging, since total_valid_global
+        # is a global (all-reduced) denominator but backward() produces rank-local gradients.
+        scale = mb_valid / total_valid_global * engine.get_data_parallel_size()
         weighted = sum(w * p * scale for w, p in zip(loss_weights, plosses))
         weighted.backward()
 

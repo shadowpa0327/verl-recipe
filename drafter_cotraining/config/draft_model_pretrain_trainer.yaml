@@ -186,8 +186,8 @@ hs_collector:
             # HF config overlay for hidden-state extraction.
             hf_config:
 
-              # Qwen3-8B has 36 hidden layers; [2, n/2, n-3] & last hidden states.
-              eagle_aux_hidden_state_layer_ids: [2, 18, 33, 35]
+              # Qwen3-8B has 36 hidden layers; [1, n/2-1, n-4, n-1].
+              eagle_aux_hidden_state_layer_ids: [2, 18, 33, 36]
 
 # Drafter training lives under actor_rollout_ref because
 # ActorRolloutRefDrafterWorker receives this subconfig.
