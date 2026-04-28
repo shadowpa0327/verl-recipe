@@ -24,6 +24,7 @@ from uuid import uuid4
 
 import numpy as np
 import ray
+import torch
 from omegaconf import DictConfig
 
 from verl.experimental.agent_loop import AsyncLLMServerManager
@@ -64,11 +65,31 @@ class AsyncHSCollectorServerManager(AsyncLLMServerManager):
         tasks = []
         prompt_lens: list[int] = []
         response_lens: list[int] = []
+        loss_masks: list[np.ndarray] = []
+        valid_tokens_list: list[int] = []
+
         for i in range(len(data)):
             sequence_ids, plen, rlen = _unpad_sequence_ids(data[i : i + 1])
             prompt_lens.append(plen)
             response_lens.append(rlen)
             tasks.append(asyncio.create_task(self.compute_hidden_states_single(sequence_ids)))
+
+            # Extract loss mask info if present (canonical format)
+            nt = data.non_tensor_batch
+            if "loss_mask" in nt and i < len(nt["loss_mask"]):
+                lm = nt["loss_mask"][i]
+                if isinstance(lm, np.ndarray):
+                    loss_masks.append(lm)
+                else:
+                    loss_masks.append(np.array([], dtype=np.int64))
+            else:
+                loss_masks.append(np.array([], dtype=np.int64))
+
+            if "valid_tokens" in nt and i < len(nt["valid_tokens"]):
+                valid_tokens_list.append(int(nt["valid_tokens"][i]))
+            else:
+                valid_tokens_list.append(max(0, rlen - 1) if rlen > 1 else 0)
+
         results = await asyncio.gather(*tasks)
 
         return DataProto(
@@ -84,6 +105,9 @@ class AsyncHSCollectorServerManager(AsyncLLMServerManager):
                 # mask semantics + sgl_engine_decode.py:249 completion_tokens-1.
                 "hs_prompt_lens": np.array(prompt_lens, dtype=np.int64),
                 "hs_response_lens": np.array(response_lens, dtype=np.int64),
+                # Loss mask for multi-turn supervision (canonical format)
+                "loss_mask": np.array(loss_masks, dtype=object),
+                "valid_tokens": np.array(valid_tokens_list, dtype=np.int64),
             },
         )
 
@@ -91,11 +115,38 @@ class AsyncHSCollectorServerManager(AsyncLLMServerManager):
 def _unpad_sequence_ids(data: DataProto) -> tuple[list[int], int, int]:
     """Extract (valid_tokens, prompt_len, response_len) from a single sample.
 
-    Left-padded prompt concatenated with right-padded response, same layout as teacher.
-    Returned token list has length ``prompt_len + response_len``.
+    Supports two formats:
+    1. Canonical: input_ids + attention_mask + loss_mask
+       - prompt_len = first position where loss_mask == 1
+       - response_len = sum(loss_mask)
+    2. Legacy: prompts + responses + input_ids + attention_mask
+       - Uses prompt_width and response_width from batch
     """
     input_ids = data.batch["input_ids"][0]
     attention_mask = data.batch["attention_mask"][0]
+
+    # Check for canonical format (loss_mask present, no prompts/responses)
+    if "loss_mask" in data.batch and "prompts" not in data.batch:
+        loss_mask = data.batch["loss_mask"][0]
+
+        # Find prompt_len: first position where loss_mask == 1
+        supervised_positions = torch.where(loss_mask == 1)[0]
+        if len(supervised_positions) == 0:
+            # No supervised tokens - use attention_mask to get sequence length
+            seq_len = int(attention_mask.sum().item())
+            tokens = input_ids[:seq_len].tolist()
+            return tokens, seq_len, 0
+
+        prompt_len = int(supervised_positions[0].item())
+        response_len = int(loss_mask.sum().item())
+
+        # Extract valid tokens (remove padding)
+        seq_len = int(attention_mask.sum().item())
+        tokens = input_ids[:seq_len].tolist()
+
+        return tokens, prompt_len, response_len
+
+    # Legacy format: prompts + responses
     prompt_width = data.batch["prompts"][0].shape[0]
     valid_prompt_length = int(attention_mask[:prompt_width].sum().item())
     valid_response_length = int(attention_mask[-data.batch["responses"][0].shape[0] :].sum().item())

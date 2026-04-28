@@ -65,8 +65,24 @@ def _sample_metas_from_hs_batch(hs_batch: DataProto) -> list[SampleMeta]:
     keys = nt["hs_mooncake_keys"]
     prompt_lens = nt.get("hs_prompt_lens")
     response_lens = nt.get("hs_response_lens")
-    return [
-        SampleMeta(
+    # New fields for canonical format
+    loss_masks = nt.get("loss_mask")
+    valid_tokens_list = nt.get("valid_tokens")
+
+    metas = []
+    for i in range(len(keys)):
+        # Prefer loss_mask numpy array if available (canonical format)
+        loss_mask_arr = None
+        valid_tok = 0
+        if loss_masks is not None and i < len(loss_masks):
+            lm = loss_masks[i]
+            if isinstance(lm, np.ndarray) and len(lm) > 0:
+                loss_mask_arr = lm
+
+        if valid_tokens_list is not None and i < len(valid_tokens_list):
+            valid_tok = int(valid_tokens_list[i])
+
+        meta = SampleMeta(
             mooncake_key=str(keys[i]),
             shapes=nt["hs_shapes"][i] if isinstance(nt["hs_shapes"][i], dict) else {},
             dtypes=nt["hs_dtypes"][i] if isinstance(nt["hs_dtypes"][i], dict) else {},
@@ -74,19 +90,21 @@ def _sample_metas_from_hs_batch(hs_batch: DataProto) -> list[SampleMeta]:
             n_tokens=int(nt["hs_seq_lens"][i]),
             prompt_len=int(prompt_lens[i]) if prompt_lens is not None else 0,
             response_len=int(response_lens[i]) if response_lens is not None else 0,
+            loss_mask=loss_mask_arr,
+            valid_tokens=valid_tok if valid_tok > 0 else (int(response_lens[i]) - 1 if response_lens is not None and response_lens[i] > 1 else 0),
         )
-        for i in range(len(keys))
-    ]
+        metas.append(meta)
+
+    return metas
 
 
 class ParquetDrafterPretrainDataset(Dataset):
-    """Read explicit prompt/response drafter pretrain rows from parquet."""
+    """Read drafter pretrain rows from parquet in canonical (messages) format."""
 
     def __init__(
         self,
         data_files,
-        prompt_messages_key: str = "prompt_messages",
-        response_key: str = "response",
+        messages_key: str = "messages",
         max_samples: int = -1,
     ):
         import pandas as pd
@@ -97,20 +115,31 @@ class ParquetDrafterPretrainDataset(Dataset):
         if not isinstance(data_files, list | ListConfig):
             data_files = [data_files]
 
-        samples: list[tuple[list[dict[str, str]], str]] = []
+        samples: list[list[dict[str, str]]] = []
+        sample_ids: list[str] = []
+
         for data_file in data_files:
             local_path = copy_local_path_from_hdfs(data_file, verbose=True)
             dataframe = pd.read_parquet(local_path, dtype_backend="pyarrow")
-            missing = [k for k in (prompt_messages_key, response_key) if k not in dataframe.columns]
-            if missing:
-                raise ValueError(f"{local_path} is missing required column(s): {missing}")
 
-            for _, row in dataframe.iterrows():
-                prompt_messages = convert_nested_value_to_list_recursive(row[prompt_messages_key])
-                response = row[response_key]
-                if not isinstance(response, str):
+            if messages_key not in dataframe.columns:
+                raise ValueError(f"{local_path} missing required column: '{messages_key}'")
+
+            for idx, row in dataframe.iterrows():
+                messages = convert_nested_value_to_list_recursive(row[messages_key])
+
+                if not messages:
                     continue
-                samples.append((prompt_messages, response))
+
+                # Validate messages have assistant content
+                has_assistant = any(m.get("role") == "assistant" for m in messages)
+                if not has_assistant:
+                    continue
+
+                samples.append(messages)
+                sample_id = row.get("id", f"sample_{len(samples)}")
+                sample_ids.append(str(sample_id) if sample_id else f"sample_{len(samples)}")
+
                 if max_samples > 0 and len(samples) >= max_samples:
                     break
             if max_samples > 0 and len(samples) >= max_samples:
@@ -119,130 +148,137 @@ class ParquetDrafterPretrainDataset(Dataset):
         if not samples:
             raise ValueError(f"No drafter pretrain samples found in {data_files}")
         self.samples = samples
+        self.sample_ids = sample_ids
 
     def __len__(self) -> int:
         return len(self.samples)
 
     def __getitem__(self, index: int) -> tuple[list[dict[str, str]], str]:
-        return self.samples[index]
-
-
-def _tokenize_prompt_response(
-    tokenizer,
-    prompt_msgs: list[dict[str, Any]],
-    response_text: str,
-    max_prompt_len: int,
-    max_response_len: int,
-    apply_chat_template_kwargs: dict[str, Any],
-) -> tuple[list[int], list[int]]:
-    prompt_text = tokenizer.apply_chat_template(
-        prompt_msgs,
-        add_generation_prompt=True,
-        tokenize=False,
-        **apply_chat_template_kwargs,
-    )
-    prompt_ids = tokenizer(prompt_text, add_special_tokens=False)["input_ids"]
-    response_ids = tokenizer(response_text, add_special_tokens=False)["input_ids"]
-
-    if len(prompt_ids) > max_prompt_len:
-        prompt_ids = prompt_ids[-max_prompt_len:]
-    if len(response_ids) > max_response_len:
-        response_ids = response_ids[:max_response_len]
-    return list(prompt_ids), list(response_ids)
-
-
-def _pad_batch_to_dataproto(
-    samples: list[tuple[list[int], list[int]]],
-    pad_token_id: int,
-    prompt_length: int,
-    response_length: int,
-) -> DataProto:
-    batch_size = len(samples)
-    prompts = torch.full((batch_size, prompt_length), pad_token_id, dtype=torch.long)
-    prompt_mask = torch.zeros((batch_size, prompt_length), dtype=torch.long)
-    responses = torch.full((batch_size, response_length), pad_token_id, dtype=torch.long)
-    response_mask = torch.zeros((batch_size, response_length), dtype=torch.long)
-
-    for i, (prompt_ids, response_ids) in enumerate(samples):
-        prompt_len = len(prompt_ids)
-        response_len = len(response_ids)
-        if prompt_len > 0:
-            prompts[i, -prompt_len:] = torch.tensor(prompt_ids, dtype=torch.long)
-            prompt_mask[i, -prompt_len:] = 1
-        if response_len > 0:
-            responses[i, :response_len] = torch.tensor(response_ids, dtype=torch.long)
-            response_mask[i, :response_len] = 1
-
-    input_ids = torch.cat([prompts, responses], dim=1)
-    attention_mask = torch.cat([prompt_mask, response_mask], dim=1)
-    position_ids = (attention_mask.cumsum(dim=1) - 1).clamp(min=0)
-    position_ids = position_ids * attention_mask
-
-    batch = DataProto.from_single_dict(
-        {
-            "prompts": prompts,
-            "responses": responses,
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "position_ids": position_ids,
-            "response_mask": response_mask,
-        }
-    )
-    batch.non_tensor_batch["uid"] = np.array(
-        [str(uuid.uuid4()) for _ in range(batch_size)], dtype=object
-    )
-    return batch
+        return self.samples[index], self.sample_ids[index]
 
 
 class DrafterPretrainCollator:
+    """Collator for canonical (messages) format with proper loss mask computation.
+
+    This collator:
+    1. Tokenizes the full conversation using tokenizer.apply_chat_template
+    2. Computes loss_mask for all assistant turns (or last turn only based on mode)
+    3. Packs the loss mask for transport through Mooncake
+    4. Handles truncation while preserving token/mask alignment
+    """
+
     def __init__(
         self,
         tokenizer,
-        max_prompt_len: int,
-        max_response_len: int,
+        max_seq_len: int,
+        loss_mask_mode: str = "all_assistant_turns",
         apply_chat_template_kwargs: dict[str, Any] | None = None,
     ):
+        """
+        Args:
+            tokenizer: HuggingFace tokenizer with chat template support.
+            max_seq_len: Maximum total sequence length.
+            loss_mask_mode: One of:
+                - "all_assistant_turns": Supervise all assistant content (default)
+                - "last_assistant_only": Supervise only final assistant message
+                - "auto": Use last-turn-only if thinking content detected
+            apply_chat_template_kwargs: Extra kwargs for tokenizer.apply_chat_template.
+        """
         self.tokenizer = tokenizer
-        self.max_prompt_len = max_prompt_len
-        self.max_response_len = max_response_len
+        self.max_seq_len = max_seq_len
+        self.loss_mask_mode = loss_mask_mode
         self.apply_chat_template_kwargs = apply_chat_template_kwargs or {}
         self.pad_token_id = (
             tokenizer.pad_token_id
             if tokenizer.pad_token_id is not None
             else tokenizer.eos_token_id
         )
+        from recipe.drafter_cotraining.loss_mask_utils import build_loss_mask_for_conversation
+
+        self._build_loss_mask = build_loss_mask_for_conversation
 
     def __call__(self, batch_rows: list[tuple[list[dict[str, str]], str]]) -> DataProto:
-        samples: list[tuple[list[int], list[int]]] = []
+        """Collate a batch of conversations into a DataProto with loss masks.
+
+        Args:
+            batch_rows: List of (messages, sample_id) tuples.
+
+        Returns:
+            DataProto with input_ids, attention_mask, loss_mask.
+        """
+
+        samples: list[dict[str, Any]] = []
         skipped = 0
-        for prompt_msgs, response_text in batch_rows:
+
+        for messages, sample_id in batch_rows:
             try:
-                prompt_ids, response_ids = _tokenize_prompt_response(
-                    self.tokenizer,
-                    prompt_msgs,
-                    response_text,
-                    self.max_prompt_len,
-                    self.max_response_len,
-                    self.apply_chat_template_kwargs,
+                result = self._build_loss_mask(
+                    tokenizer=self.tokenizer,
+                    messages=messages,
+                    max_length=self.max_seq_len,
+                    loss_mask_mode=self.loss_mask_mode,
                 )
             except Exception as exc:  # noqa: BLE001
                 skipped += 1
                 logger.warning("Skipping malformed pretrain row: %s", exc)
                 continue
-            if not prompt_ids or not response_ids:
+
+            if result is None:
                 skipped += 1
+                logger.warning("Skipping row with empty loss mask: %s", sample_id)
                 continue
-            samples.append((prompt_ids, response_ids))
+
+            samples.append({
+                "input_ids": result.input_ids,
+                "loss_mask": result.loss_mask,
+                "valid_tokens": result.valid_tokens,
+                "sample_id": sample_id,
+            })
 
         if not samples:
             raise ValueError(f"All {len(batch_rows)} rows in this batch were invalid")
 
-        batch = _pad_batch_to_dataproto(
-            samples=samples,
-            pad_token_id=self.pad_token_id,
-            prompt_length=self.max_prompt_len,
-            response_length=self.max_response_len,
+        # Find max length in batch
+        max_len = max(s["input_ids"].shape[0] for s in samples)
+        # Round up to 256-token bucket for torch.compile stability
+        bucket = 256
+        max_len = ((max_len + bucket - 1) // bucket) * bucket
+
+        batch_size = len(samples)
+        input_ids = torch.full((batch_size, max_len), self.pad_token_id, dtype=torch.long)
+        attention_mask = torch.zeros((batch_size, max_len), dtype=torch.long)
+        loss_mask = torch.zeros((batch_size, max_len), dtype=torch.long)
+
+        # Store unpadded loss_masks as numpy arrays (dtype=object for variable length)
+        loss_masks_np: list[np.ndarray] = []
+        valid_tokens_list: list[int] = []
+        sample_ids: list[str] = []
+
+        for i, sample in enumerate(samples):
+            seq_len = sample["input_ids"].shape[0]
+            input_ids[i, :seq_len] = sample["input_ids"]
+            attention_mask[i, :seq_len] = 1
+            loss_mask[i, :seq_len] = sample["loss_mask"]
+            # Store unpadded loss_mask as numpy array for transport
+            loss_masks_np.append(sample["loss_mask"].cpu().numpy())
+            valid_tokens_list.append(sample["valid_tokens"])
+            sample_ids.append(sample["sample_id"])
+
+        batch = DataProto.from_single_dict(
+            {
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "loss_mask": loss_mask,
+            }
         )
+        batch.non_tensor_batch["uid"] = np.array(sample_ids, dtype=object)
+        batch.non_tensor_batch["loss_mask"] = np.array(loss_masks_np, dtype=object)
+        batch.non_tensor_batch["valid_tokens"] = np.array(valid_tokens_list, dtype=np.int64)
+
+        # Legacy fields for backward compatibility
+        batch.non_tensor_batch["hs_prompt_lens"] = np.zeros(batch_size, dtype=np.int64)
+        batch.non_tensor_batch["hs_response_lens"] = np.array(valid_tokens_list, dtype=np.int64)
+
         batch.meta_info["skipped_rows"] = skipped
         return batch
 
@@ -320,17 +356,27 @@ class DraftModelPretrainTrainer:
         data_files,
         max_samples: int,
     ) -> Dataset | None:
+        """Build pretrain dataset from canonical (messages) format.
+
+        Args:
+            data_files: Path(s) to parquet files with 'messages' column.
+            max_samples: Maximum samples to load (-1 for no limit).
+
+        Returns:
+            Dataset instance.
+        """
         if not data_files:
             return None
+
         return ParquetDrafterPretrainDataset(
             data_files,
-            prompt_messages_key=self.config.data.get("prompt_messages_key", "prompt_messages"),
-            response_key=self.config.data.get("response_key", "response"),
+            messages_key=self.config.data.get("messages_key", "messages"),
             max_samples=max_samples,
         )
 
     def _create_dataloader(self, train_dataset):
         data_cfg = self.config.data
+
         if train_dataset is None:
             train_dataset = self._build_pretrain_dataset(
                 data_files=data_cfg.train_files,
@@ -348,12 +394,16 @@ class DraftModelPretrainTrainer:
         )
         self.val_dataset = val_dataset
 
+        # Create collator with loss mask support
+        loss_mask_mode = data_cfg.get("loss_mask_mode", "all_assistant_turns")
+        max_seq_len = int(data_cfg.get("max_seq_len", data_cfg.max_prompt_length + data_cfg.max_response_length))
         collator = DrafterPretrainCollator(
             tokenizer=self.tokenizer,
-            max_prompt_len=int(data_cfg.max_prompt_length),
-            max_response_len=int(data_cfg.max_response_length),
+            max_seq_len=max_seq_len,
+            loss_mask_mode=loss_mask_mode,
             apply_chat_template_kwargs=data_cfg.get("apply_chat_template_kwargs", {}) or {},
         )
+
 
         self.train_dataloader = StatefulDataLoader(
             dataset=self.train_dataset,

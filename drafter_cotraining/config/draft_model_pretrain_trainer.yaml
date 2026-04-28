@@ -32,20 +32,17 @@ pretrain:
   # Save a final drafter checkpoint at the last completed step.
   save_final: True
 
-# Drafter pretrain data. Parquet files contain explicit prompt/response columns.
+# Drafter pretrain data. Parquet files use canonical 'messages' format.
 data:
 
-  # Training parquet emitted by scripts/data_preprocess/qwen3_8b_eagle3.py.
+  # Training parquet with 'messages' column containing full conversations.
   train_files: ~/data/qwen3_8b_eagle3/train.parquet
 
-  # Evaluation parquet emitted by scripts/data_preprocess/qwen3_8b_eagle3.py.
+  # Evaluation parquet with 'messages' column.
   eval_files: ~/data/qwen3_8b_eagle3/test.parquet
 
-  # The field containing prompt messages before the target response.
-  prompt_messages_key: prompt_messages
-
-  # The field containing the target assistant response text.
-  response_key: response
+  # The field containing the full conversation as a list of message dicts.
+  messages_key: messages
 
   # Trust Qwen tokenizer/processor remote code by default for this pretrain dataset.
   trust_remote_code: True
@@ -56,10 +53,13 @@ data:
   # Drafter pretrain batch size.
   train_batch_size: 8
 
-  # Prompt window used by the DataProto builder.
+  # Maximum total sequence length (will be computed from max_prompt + max_response if not set).
+  max_seq_len: 1024
+
+  # Prompt window (used for computing max_seq_len if max_seq_len not set).
   max_prompt_length: 512
 
-  # Response window used by the DataProto builder.
+  # Response window (used for computing max_seq_len if max_seq_len not set).
   max_response_length: 512
 
   # Extra tokenizer.apply_chat_template kwargs.
@@ -67,6 +67,13 @@ data:
 
   # Shuffle rows each epoch.
   shuffle: True
+
+  # Loss mask mode for multi-turn supervision.
+  # Options: all_assistant_turns, last_assistant_only, auto
+  # - all_assistant_turns: Supervise all assistant content (default for pretraining)
+  # - last_assistant_only: Supervise only the final assistant message
+  # - auto: Use last_turn_only if thinking content detected, else all turns
+  loss_mask_mode: all_assistant_turns
 
 # Mooncake connection info shared by HS producer and drafter reader.
 mooncake:

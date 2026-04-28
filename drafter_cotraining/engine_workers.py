@@ -223,9 +223,17 @@ class ActorRolloutRefDrafterWorker(ActorRolloutRefWorker):
             return DataProto(non_tensor_batch=data.non_tensor_batch)
 
         # ── Step 1: metadata-only empty-mask filter (TorchSpec data_fetcher.py:177)
+        # Prefer valid_tokens (canonical format) over response_lens (legacy format)
+        valid_tokens_list = data.non_tensor_batch.get("valid_tokens", [])
         response_lens = data.non_tensor_batch.get("response_lens", [])
-        if len(response_lens) > 0:
-            keep = [int(r) - 1 > 0 for r in response_lens]
+
+        if len(valid_tokens_list) > 0 or len(response_lens) > 0:
+            # Use valid_tokens if available, otherwise fall back to response_lens
+            if len(valid_tokens_list) > 0:
+                keep = [int(v) > 0 for v in valid_tokens_list]
+            else:
+                keep = [int(r) - 1 > 0 for r in response_lens]
+
             n_dropped = sum(1 for k in keep if not k)
             if n_dropped > 0:
                 logger.warning(
@@ -251,13 +259,18 @@ class ActorRolloutRefDrafterWorker(ActorRolloutRefWorker):
                 data = self._select_data_indices(data, kept_indices)
                 mooncake_keys = data.non_tensor_batch.get("mooncake_keys", [])
                 response_lens = data.non_tensor_batch.get("response_lens", [])
+                valid_tokens_list = data.non_tensor_batch.get("valid_tokens", [])
 
         if len(mooncake_keys) == 0:
             logger.warning("[drafter rank=%d] all samples filtered; skipping macro-step", rank)
             return DataProto(non_tensor_batch=data.non_tensor_batch)
 
         # ── Step 2: preflight total_valid_global from metadata (no fetch needed)
-        local_total_valid = sum(max(0, int(r) - 1) for r in response_lens)
+        # Use valid_tokens if available (canonical format), else response_lens-1 (legacy)
+        if len(valid_tokens_list) > 0:
+            local_total_valid = sum(int(v) for v in valid_tokens_list)
+        else:
+            local_total_valid = sum(max(0, int(r) - 1) for r in response_lens)
         total_valid_global = self._allreduce_sum_int(local_total_valid)
         if total_valid_global == 0:
             logger.warning("[drafter rank=%d] total_valid_global=0; skipping", rank)
@@ -268,8 +281,14 @@ class ActorRolloutRefDrafterWorker(ActorRolloutRefWorker):
         # cache doesn't fragment per-rank. Also keeps the resulting
         # train_metrics dict bitwise-equal across ranks (verl's DataProto.concat
         # asserts on conflicting meta_info values).
-        prompt_lens = data.non_tensor_batch.get("prompt_lens", [0] * len(mooncake_keys))
-        seq_lens = [int(p) + int(r) for p, r in zip(prompt_lens, response_lens)]
+        # Use seq_lens if available (from metadata), else compute from prompt/response
+        seq_lens_meta = data.non_tensor_batch.get("seq_lens", [])
+        if len(seq_lens_meta) > 0:
+            seq_lens = [int(s) for s in seq_lens_meta]
+        else:
+            prompt_lens = data.non_tensor_batch.get("prompt_lens", [0] * len(mooncake_keys))
+            response_lens = data.non_tensor_batch.get("response_lens", [0] * len(mooncake_keys))
+            seq_lens = [int(p) + int(r) for p, r in zip(prompt_lens, response_lens)]
         local_t_pad = max(seq_lens) if seq_lens else 0
         t_pad_macro = self._allreduce_max_int(local_t_pad)
 
@@ -343,12 +362,18 @@ class ActorRolloutRefDrafterWorker(ActorRolloutRefWorker):
             (still snapped to a 256-token bucket). Lets the macro-step
             pre-compute T_pad once across all micro-batches so torch.compile
             doesn't recompile per micro-batch.
+
+        Loss mask priority:
+        1. loss_mask numpy array (canonical format) - convert to tensor directly
+        2. prompt_lens/response_lens (legacy format) - compute response-only mask
         """
         mooncake_keys = data.non_tensor_batch.get("mooncake_keys", [])
         shapes_list = data.non_tensor_batch.get("shapes", [])
         dtypes_list = data.non_tensor_batch.get("dtypes", [])
         prompt_lens = data.non_tensor_batch.get("prompt_lens", [])
         response_lens = data.non_tensor_batch.get("response_lens", [])
+        loss_masks_np = data.non_tensor_batch.get("loss_mask", [])
+        valid_tokens_list = data.non_tensor_batch.get("valid_tokens", [])
 
         store = self._get_mooncake_store(data.meta_info.get("mooncake_cfg", {}), rank)
         if store is None:
@@ -372,23 +397,45 @@ class ActorRolloutRefDrafterWorker(ActorRolloutRefWorker):
             # Add batch dim — collator expects [1, T] / [1, T, D] per sample.
             ids = out.input_ids.unsqueeze(0) if out.input_ids.dim() == 1 else out.input_ids
             hs = out.hidden_states.unsqueeze(0) if out.hidden_states.dim() == 2 else out.hidden_states
-            # Response-only loss mask — zeros on prompt positions, ones on
-            # response positions EXCEPT the last (next-token prediction has no
-            # valid target at the final response position; matches TorchSpec
-            # sgl_engine_decode.py:249 `completion_tokens - 1` and the
-            # `loss_mask[0, -1] = 0` in preprocessing.py:329-331). When either
-            # length is missing we fall back to all-ones so the engine still
-            # runs (degraded signal).
+
             seq_len = int(ids.shape[-1])
-            plen = int(prompt_lens[i]) if i < len(prompt_lens) else 0
-            rlen = int(response_lens[i]) if i < len(response_lens) else 0
-            if rlen > 1:
-                loss_mask = torch.zeros_like(ids).long()
-                # rlen-1 ones: positions [plen, plen+rlen-1) — drops the last.
-                end = min(plen + rlen - 1, seq_len)
-                loss_mask[..., plen:end] = 1
+
+            # Build loss_mask - prefer loss_mask numpy array (canonical format)
+            has_loss_mask = (
+                loss_masks_np is not None
+                and i < len(loss_masks_np)
+                and isinstance(loss_masks_np[i], np.ndarray)
+                and len(loss_masks_np[i]) > 0
+            )
+
+            if has_loss_mask:
+                # Canonical format: convert numpy array to tensor directly
+                # The loss_mask from non_tensor_batch may be object dtype, need to cast
+                lm_np = loss_masks_np[i]
+                if lm_np.dtype == object:
+                    lm_np = lm_np.astype(np.int64)
+                loss_mask = torch.from_numpy(lm_np.copy()).long()
+                # Ensure mask matches sequence length (truncation may have occurred)
+                if len(loss_mask) > seq_len:
+                    loss_mask = loss_mask[:seq_len]
+                elif len(loss_mask) < seq_len:
+                    # Pad with zeros (padding positions shouldn't be supervised)
+                    padding = torch.zeros(seq_len - len(loss_mask), dtype=torch.long)
+                    loss_mask = torch.cat([loss_mask, padding])
+                loss_mask = loss_mask.unsqueeze(0).to(ids.device)
             else:
-                loss_mask = torch.ones_like(ids).long()
+                # Legacy format: compute response-only mask from prompt_lens/response_lens
+                plen = int(prompt_lens[i]) if i < len(prompt_lens) else 0
+                rlen = int(response_lens[i]) if i < len(response_lens) else 0
+                if rlen > 1:
+                    loss_mask = torch.zeros_like(ids).long()
+                    # rlen-1 ones: positions [plen, plen+rlen-1) — drops the last.
+                    end = min(plen + rlen - 1, seq_len)
+                    loss_mask[..., plen:end] = 1
+                else:
+                    # Fallback to all-ones (degraded signal)
+                    loss_mask = torch.ones_like(ids).long()
+
             feat = {
                 "input_ids": ids,
                 "hidden_states": hs,

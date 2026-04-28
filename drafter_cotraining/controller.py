@@ -50,6 +50,11 @@ class SampleMeta:
     Consumed by ``update_drafter`` to build a response-only
     ``loss_mask = [0]*prompt_len + [1]*(response_len - 1)`` (final response
     position dropped — no valid next-token target).
+
+    For canonical format with multi-turn loss masks:
+    - ``loss_mask`` contains the numpy array (unpadded) for multi-turn supervision
+    - ``valid_tokens`` is the count of supervised positions
+    - ``prompt_len`` and ``response_len`` are set to 0 for backward compatibility
     """
 
     mooncake_key: str
@@ -59,6 +64,8 @@ class SampleMeta:
     n_tokens: int = 0
     prompt_len: int = 0
     response_len: int = 0
+    loss_mask: Optional[np.ndarray] = None  # Unpadded loss mask (canonical format)
+    valid_tokens: int = 0  # Count of supervised positions (from loss_mask.sum())
 
 
 class DrafterDataController:
@@ -163,6 +170,12 @@ class DrafterDataController:
                 ),
                 'response_lens': np.array(
                     [m.response_len for m in self._sample_pool], dtype=object
+                ),
+                'loss_mask': np.array(
+                    [m.loss_mask for m in self._sample_pool], dtype=object
+                ),
+                'valid_tokens': np.array(
+                    [m.valid_tokens for m in self._sample_pool], dtype=np.int64
                 ),
             },
         )
