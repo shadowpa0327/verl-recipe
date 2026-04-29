@@ -620,9 +620,15 @@ class ActorRolloutRefDrafterWorker(ActorRolloutRefWorker):
                 "mb_valid": 0,
             }
 
-        # Exact mean divisor: Σ_k (mb_valid_k / total_valid_global) · per_pos_mean_k
-        # = (1 / total_valid_global) · Σ_k Σ_pos per_pos_loss = mean over total valid.
-        scale = mb_valid / total_valid_global
+        # Exact mean divisor with FSDP grad-averaging cancellation:
+        #   per-rank: L_r = Σ_k (mb_valid_k / total_valid_global) · per_pos_mean_k
+        #   Σ_r L_r = global-token mean (the construction).
+        # FSDP2 reduce-scatter averages grads across DP → grad lands as
+        # grad(L_global) / dp_size. Multiplying scale by dp_size cancels that
+        # averaging so backward sees grad(L_global). Mirrors verl's canonical
+        # global-token loss pattern (verl/workers/utils/losses.py:50,
+        # verl/trainer/ppo/core_algos.py:1173/1181/1195: `... / batch_num_tokens * dp_size`).
+        scale = mb_valid / total_valid_global * engine.get_data_parallel_size()
         weighted = sum(w * p * scale for w, p in zip(loss_weights, plosses))
         weighted.backward()
 
