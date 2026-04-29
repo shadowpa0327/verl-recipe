@@ -199,7 +199,7 @@ actor_rollout_ref:
       # gets its own FSDP unit; lm_head/norm/fc/embed_tokens stay in the root
       # unit so they remain gathered through backward (auto-root-detect sets
       # the root's effective reshard_after_forward=False). The override lives
-      # in FSDPDrafterEngine._build_fsdp_module — see drafter_engine.py.
+      # in FSDPDrafterEngine._build_fsdp_module — see engine/drafter_engine.py.
       # Without this override, verl's default apply_fsdp2 would wrap lm_head as
       # its own sub-unit (when tie_word_embeddings=False, e.g. Qwen3-8B), which
       # would cause the compiled loss kernel to see a non-gathered DTensor.

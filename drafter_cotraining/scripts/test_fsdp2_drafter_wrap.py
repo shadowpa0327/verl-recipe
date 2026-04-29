@@ -296,7 +296,7 @@ def test_lazy_forward_backward(model, device, log):
 
 def test_lazy_micro_batch_accumulation(model, device, log, num_micro: int = 3):
     """[T7] Multi-iteration accumulation simulating the production micro-batch
-    loop (engine_workers.py::_drafter_train_step_micro) on the LAZY path.
+    loop (engine/workers.py::_drafter_train_step_micro) on the LAZY path.
 
     For mb_idx in range(num_micro):
         set_requires_gradient_sync(mb_idx == num_micro - 1)

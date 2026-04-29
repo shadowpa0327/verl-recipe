@@ -294,7 +294,7 @@ actor_rollout_ref:
       # gets its own FSDP unit; lm_head/norm/fc/embed_tokens stay in the root
       # unit so they remain gathered through backward (auto-root-detect sets
       # the root's effective reshard_after_forward=False). The override lives
-      # in FSDPDrafterEngine._build_fsdp_module — see drafter_engine.py.
+      # in FSDPDrafterEngine._build_fsdp_module — see engine/drafter_engine.py.
       strategy: fsdp2
 
       # FSDP group size.
