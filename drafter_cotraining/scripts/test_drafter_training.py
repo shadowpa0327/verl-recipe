@@ -42,7 +42,7 @@ import numpy as np
 import ray
 
 from verl import DataProto
-from recipe.drafter_cotraining.ray_trainer import _sample_metas_from_hs_batch
+from recipe.drafter_cotraining.trainer.ray_trainer import _sample_metas_from_hs_batch
 from recipe.drafter_cotraining.scripts.test_drafter_rollout_hs import (
     MicroDrafterCTTaskRunner,
     MicroRolloutHSOnlyTrainer,

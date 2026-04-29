@@ -53,7 +53,7 @@ import ray
 import torch
 
 from verl import DataProto
-from recipe.drafter_cotraining.ray_trainer import _sample_metas_from_hs_batch
+from recipe.drafter_cotraining.trainer.ray_trainer import _sample_metas_from_hs_batch
 from recipe.drafter_cotraining.scripts.test_drafter_rollout_hs import (
     MicroDrafterCTTaskRunner,
     MicroRolloutHSOnlyTrainer,
@@ -101,7 +101,7 @@ def _iterate_offline_batches(
     offline diagnostic exercises the per-turn assistant loss-mask path
     end-to-end.
     """
-    from recipe.drafter_cotraining.draft_model_pretrain_trainer import (
+    from recipe.drafter_cotraining.trainer.pretrain_trainer import (
         DrafterPretrainCollator,
     )
 

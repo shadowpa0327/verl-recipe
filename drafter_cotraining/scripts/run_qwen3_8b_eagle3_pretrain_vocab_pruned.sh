@@ -86,7 +86,7 @@ if [ ! -f "$VOCAB_MAPPING_PATH" ]; then
 fi
 
 cd "$VERL_ROOT"
-"$PYTHON_BIN" -m recipe.drafter_cotraining.draft_model_pretrain_trainer \
+"$PYTHON_BIN" -m recipe.drafter_cotraining.main_drafter_pretrain \
     --config-name draft_model_pretrain_trainer \
     data.train_files="['$TRAIN_FILE']" \
     data.eval_files="['$VAL_FILE']" \

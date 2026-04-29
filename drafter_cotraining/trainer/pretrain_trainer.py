@@ -40,7 +40,6 @@ import sys
 import uuid
 from typing import Any
 
-import hydra
 import numpy as np
 import ray
 import torch
@@ -53,7 +52,7 @@ from verl import DataProto
 from verl.single_controller.ray import RayWorkerGroup, ResourcePoolManager
 from verl.trainer.constants_ppo import get_ppo_ray_runtime_env
 from verl.utils.debug import marked_timer
-from verl.utils.device import auto_set_device, is_cuda_available
+from verl.utils.device import is_cuda_available
 from verl.utils.tracking import Tracking
 
 from recipe.drafter_cotraining.controller import DrafterDataController, SampleMeta
@@ -794,6 +793,7 @@ def _ensure_ray_initialized(config):
 
 def run_draft_model_pretrain(config) -> None:
     _ensure_ray_initialized(config)
+    _launch_mooncake_master_if_needed(config)
     task_runner_class = ray.remote(num_cpus=1)(DraftModelPretrainTaskRunner)
 
     if (
@@ -817,15 +817,3 @@ def run_draft_model_pretrain(config) -> None:
     timeline_json_file = config.ray_kwargs.get("timeline_json_file", None)
     if timeline_json_file:
         ray.timeline(filename=timeline_json_file)
-
-
-@hydra.main(config_path="config", config_name="draft_model_pretrain_trainer", version_base=None)
-def main(config):
-    auto_set_device(config)
-    _ensure_ray_initialized(config)
-    _launch_mooncake_master_if_needed(config)
-    run_draft_model_pretrain(config)
-
-
-if __name__ == "__main__":
-    main()

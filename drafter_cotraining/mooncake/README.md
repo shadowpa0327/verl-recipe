@@ -157,7 +157,7 @@ In IPv6-only mode, use `::1` instead of `localhost` or `127.0.0.1`:
 | `mooncake/master.py` | IPv6 detection, P2PHANDSHAKE mode for master startup |
 | `mooncake/store.py` | IPv6 environment variable setup for client |
 | `mooncake/config.py` | IPv6 bracket notation handling |
-| `draft_model_pretrain_trainer.py` | P2PHANDSHAKE port parsing |
+| `trainer/pretrain_trainer.py` | P2PHANDSHAKE port parsing |
 | `scripts/test_mooncake_store.py` | Test script with P2PHANDSHAKE support |
 
 ## Upstream Issues

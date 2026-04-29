@@ -111,7 +111,7 @@ class DrafterCTTaskRunner(TaskRunner):
         train_sampler = create_rl_sampler(config.data, train_dataset)
 
         # Use RayDrafterCTPPOTrainer instead of RayPPOTrainer
-        from recipe.drafter_cotraining.ray_trainer import RayDrafterCTPPOTrainer
+        from recipe.drafter_cotraining.trainer.ray_trainer import RayDrafterCTPPOTrainer
 
         trainer = RayDrafterCTPPOTrainer(
             config=config,

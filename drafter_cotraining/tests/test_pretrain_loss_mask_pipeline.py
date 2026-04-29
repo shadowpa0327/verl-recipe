@@ -125,7 +125,7 @@ def test_loss_mask_supervises_every_assistant_turn(tokenizer):
 def test_dataset_collator_pipeline(tmp_path, tokenizer, synthetic_conversations):
     """Round-trip a parquet file through the dataset + collator and check that
     the output DataProto has the right shape and mask plumbing."""
-    from recipe.drafter_cotraining.draft_model_pretrain_trainer import (
+    from recipe.drafter_cotraining.trainer.pretrain_trainer import (
         ParquetDrafterPretrainDataset,
         DrafterPretrainCollator,
     )
@@ -229,7 +229,7 @@ def test_controller_round_trip_preserves_mask():
     from verl import DataProto
 
     from recipe.drafter_cotraining.controller import DrafterDataController
-    from recipe.drafter_cotraining.draft_model_pretrain_trainer import (
+    from recipe.drafter_cotraining.trainer.pretrain_trainer import (
         _sample_metas_from_hs_batch,
     )
 

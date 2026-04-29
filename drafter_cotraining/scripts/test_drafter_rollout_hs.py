@@ -52,7 +52,7 @@ import ray
 import torch
 
 from verl import DataProto
-from recipe.drafter_cotraining.ray_trainer import (
+from recipe.drafter_cotraining.trainer.ray_trainer import (
     RayDrafterCTPPOTrainer,
     _sample_metas_from_hs_batch,
 )

@@ -274,8 +274,8 @@ class ActorRolloutRefDrafterWorker(ActorRolloutRefWorker):
         t_pad_macro = self._allreduce_max_int(local_t_pad)
 
         # ── Step 4-5: micro-batch loop + optimizer step
-        # self.config is already the actor_rollout_ref slice (see ray_trainer.py:717
-        # and draft_model_pretrain_trainer.py:288).
+        # self.config is already the actor_rollout_ref slice (see trainer/ray_trainer.py:717
+        # and trainer/pretrain_trainer.py:288).
         micro_size = int(
             self.config.drafter.engine_config.get("micro_batch_size_per_gpu", 1)
         )
