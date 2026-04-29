@@ -1,7 +1,7 @@
 """Standalone FSDP2 selective-wrap test for the drafter.
 
 Exercises the TorchSpec-style selective wrap path used by
-`FSDPDrafterEngine._build_fsdp_module` (recipe/drafter_cotraining/drafter_engine.py):
+`FSDPDrafterEngine._build_fsdp_module` (recipe/drafter_cotraining/engine/drafter_engine.py):
 shard ONLY `LlamaDecoderLayer`; let `lm_head`/`norm`/`fc`/`embed_tokens` stay in
 the root unit so they're auto-kept-gathered through forward → backward (because
 PyTorch's `fully_shard` auto-detects the root and forces its effective

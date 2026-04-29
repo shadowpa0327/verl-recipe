@@ -98,7 +98,7 @@ class ActorRolloutRefDrafterWorker(ActorRolloutRefWorker):
         from verl.workers.config import FSDPEngineConfig, FSDPOptimizerConfig
         from verl.workers.engine_workers import TrainingWorker, TrainingWorkerConfig
 
-        from recipe.drafter_cotraining.drafter_engine import (
+        from recipe.drafter_cotraining.engine.drafter_engine import (
             DrafterModelConfig,
             build_drafter_subconfig,
         )
@@ -368,8 +368,8 @@ class ActorRolloutRefDrafterWorker(ActorRolloutRefWorker):
 
         device = torch.device("cuda", torch.cuda.current_device())
 
-        from recipe.drafter_cotraining.eagle3_collator import Eagle3Collator
-        collator = Eagle3Collator()
+        from recipe.drafter_cotraining.data.collator import DataCollatorWithPadding
+        collator = DataCollatorWithPadding()
 
         features = []
         for i in range(len(mooncake_keys)):

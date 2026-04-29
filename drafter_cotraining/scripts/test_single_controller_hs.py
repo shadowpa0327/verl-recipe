@@ -131,7 +131,7 @@ def fmt_bytes(n):
 # ─── Main simulation ──────────────────────────────────────
 
 def run_simulation(args):
-    from recipe.drafter_cotraining.controller import DrafterDataController, SequenceMeta, SampleMeta
+    from recipe.drafter_cotraining.data.controller import DrafterDataController, SequenceMeta, SampleMeta
     from recipe.drafter_cotraining.mooncake.eagle_store import EagleMooncakeStore
 
     mc_config = make_mooncake_config(

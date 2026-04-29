@@ -55,8 +55,8 @@ from verl.utils.debug import marked_timer
 from verl.utils.device import is_cuda_available
 from verl.utils.tracking import Tracking
 
-from recipe.drafter_cotraining.controller import DrafterDataController, SampleMeta
-from recipe.drafter_cotraining.engine_workers import DrafterPretrainWorker
+from recipe.drafter_cotraining.data.controller import DrafterDataController, SampleMeta
+from recipe.drafter_cotraining.engine.workers import DrafterPretrainWorker
 
 logger = logging.getLogger(__name__)
 DRAFTER_ROLE = "drafter"

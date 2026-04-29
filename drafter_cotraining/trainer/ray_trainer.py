@@ -60,7 +60,7 @@ from verl.utils.debug import marked_timer
 from verl.utils.metric import reduce_metrics
 from verl.utils.rollout_skip import RolloutSkip
 
-from recipe.drafter_cotraining.controller import DrafterDataController, SampleMeta
+from recipe.drafter_cotraining.data.controller import DrafterDataController, SampleMeta
 
 
 def _sample_metas_from_hs_batch(hs_batch: DataProto) -> list[SampleMeta]:
