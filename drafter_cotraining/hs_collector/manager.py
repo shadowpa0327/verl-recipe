@@ -67,7 +67,7 @@ class AsyncHSCollectorServerManager(AsyncLLMServerManager):
         in the output non_tensor_batch under ``hs_loss_masks``. The drafter
         worker reads that mask back when building the per-rank training
         batch — every assistant content token is supervised (1), everything
-        else is 0. See ``recipe/drafter_cotraining/data_preprocessing.py``.
+        else is 0. See ``recipe/drafter_cotraining/utils/chat_template_tokenize.py``.
         """
         tasks = []
         loss_masks: list[np.ndarray] = []

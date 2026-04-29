@@ -504,7 +504,7 @@ class FSDPDrafterEngine(FSDPEngine):
         both shapes against the draft model's configured vocab sizes so
         a mismatched mapping fails fast instead of silently mis-slicing.
         """
-        from recipe.drafter_cotraining.vocab_mapping import load_vocab_mapping
+        from recipe.drafter_cotraining.utils.vocab_mapping import load_vocab_mapping
 
         draft_model = self._get_draft_model()
         if not hasattr(draft_model, "t2d") or not hasattr(draft_model, "d2t"):

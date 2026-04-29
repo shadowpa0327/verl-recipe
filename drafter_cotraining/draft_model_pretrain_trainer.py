@@ -236,7 +236,7 @@ class DrafterPretrainCollator:
         chat_template: str,
         apply_chat_template_kwargs: dict[str, Any] | None = None,
     ):
-        from recipe.drafter_cotraining.data_preprocessing import (
+        from recipe.drafter_cotraining.utils.chat_template_tokenize import (
             build_input_ids_and_loss_mask,
         )
 

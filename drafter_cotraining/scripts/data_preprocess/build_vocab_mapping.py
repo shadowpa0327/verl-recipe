@@ -40,8 +40,8 @@ from typing import Iterable
 
 import pandas as pd
 
-from recipe.drafter_cotraining.data_preprocessing import build_input_ids_and_loss_mask
-from recipe.drafter_cotraining.vocab_mapping import generate_vocab_mapping_file
+from recipe.drafter_cotraining.utils.chat_template_tokenize import build_input_ids_and_loss_mask
+from recipe.drafter_cotraining.utils.vocab_mapping import generate_vocab_mapping_file
 from verl.utils.fs import copy_local_path_from_hdfs
 from verl.utils.py_functional import convert_nested_value_to_list_recursive
 
@@ -62,7 +62,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--chat_template",
         required=True,
-        help="Short chat-template name registered in data_preprocessing.get_anchors (e.g. qwen, llama3).",
+        help="Short chat-template name registered in utils.chat_template_tokenize (e.g. qwen, llama3).",
     )
     parser.add_argument(
         "--max_length",

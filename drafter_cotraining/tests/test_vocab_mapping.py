@@ -17,7 +17,7 @@ from collections import Counter
 
 import torch
 
-from recipe.drafter_cotraining.vocab_mapping import (
+from recipe.drafter_cotraining.utils.vocab_mapping import (
     generate_vocab_mapping_file,
     load_vocab_mapping,
     process_token_dict_to_mappings,

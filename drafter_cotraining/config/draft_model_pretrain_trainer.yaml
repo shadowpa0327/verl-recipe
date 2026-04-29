@@ -48,7 +48,7 @@ data:
   id_key: id
 
   # Chat-template name used to anchor assistant spans for the loss mask.
-  # See recipe/drafter_cotraining/data_preprocessing.py for the registry.
+  # See recipe/drafter_cotraining/utils/chat_template_tokenize.py for the registry.
   chat_template: qwen
 
   # Trust Qwen tokenizer/processor remote code by default for this pretrain dataset.

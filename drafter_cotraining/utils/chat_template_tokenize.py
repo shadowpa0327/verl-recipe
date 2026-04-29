@@ -33,14 +33,8 @@ import torch
 
 
 @dataclass(frozen=True)
-class ChatTemplateAnchors:
-    """Strings used to find assistant content spans inside the rendered text.
-
-    These mirror TorchSpec's ``ChatTemplate``. The two header / EOT strings
-    are sufficient to build the regex; ``system_prompt`` is the fallback we
-    inject when the conversation has no system turn (matches TorchSpec's
-    ``GeneralParser.format``).
-    """
+class _ChatTemplateAnchors:
+    """Strings used to find assistant content spans inside the rendered text."""
 
     assistant_header: str
     end_of_turn_token: str
@@ -49,13 +43,13 @@ class ChatTemplateAnchors:
 
 # Chat-template anchors keyed by short name, matching TorchSpec's registry.
 # Add more entries here as new model families are needed.
-_ANCHOR_REGISTRY: dict[str, ChatTemplateAnchors] = {
-    "qwen": ChatTemplateAnchors(
+_ANCHOR_REGISTRY: dict[str, _ChatTemplateAnchors] = {
+    "qwen": _ChatTemplateAnchors(
         assistant_header="<|im_start|>assistant\n",
         end_of_turn_token="<|im_end|>\n",
         system_prompt="You are a helpful assistant.",
     ),
-    "qwen3-instruct": ChatTemplateAnchors(
+    "qwen3-instruct": _ChatTemplateAnchors(
         # Qwen3-Instruct injects an empty <think>...</think> block right after
         # the assistant header. Anchoring on that ensures the loss mask covers
         # the post-think content (matches TorchSpec's qwen3-instruct entry).
@@ -63,7 +57,7 @@ _ANCHOR_REGISTRY: dict[str, ChatTemplateAnchors] = {
         end_of_turn_token="<|im_end|>\n",
         system_prompt="You are a helpful assistant.",
     ),
-    "llama3": ChatTemplateAnchors(
+    "llama3": _ChatTemplateAnchors(
         assistant_header="<|start_header_id|>assistant<|end_header_id|>\n\n",
         end_of_turn_token="<|eot_id|>",
         system_prompt=(
@@ -74,7 +68,7 @@ _ANCHOR_REGISTRY: dict[str, ChatTemplateAnchors] = {
 }
 
 
-def get_anchors(name: str) -> ChatTemplateAnchors:
+def _get_anchors(name: str) -> _ChatTemplateAnchors:
     if name not in _ANCHOR_REGISTRY:
         raise ValueError(
             f"Unknown chat_template name {name!r}. "
@@ -98,10 +92,10 @@ def _ensure_system_prompt(
     return [{"role": "system", "content": system_prompt}, *conversation]
 
 
-def render_conversation(
+def _render_conversation(
     tokenizer,
     conversation: list[dict[str, Any]],
-    anchors: ChatTemplateAnchors | None = None,
+    anchors: _ChatTemplateAnchors,
     apply_chat_template_kwargs: dict[str, Any] | None = None,
 ) -> str:
     """Apply the tokenizer's chat template (Jinja) to a canonical conversation.
@@ -111,18 +105,14 @@ def render_conversation(
     """
     kwargs = dict(apply_chat_template_kwargs or {})
     kwargs.setdefault("add_generation_prompt", False)
-    msgs = (
-        _ensure_system_prompt(conversation, anchors.system_prompt)
-        if anchors is not None
-        else conversation
-    )
+    msgs = _ensure_system_prompt(conversation, anchors.system_prompt)
     return tokenizer.apply_chat_template(msgs, tokenize=False, **kwargs)
 
 
-def tokenize_with_assistant_mask(
+def _tokenize_with_assistant_mask(
     tokenizer,
     formatted_text: str,
-    anchors: ChatTemplateAnchors,
+    anchors: _ChatTemplateAnchors,
     max_length: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Tokenize ``formatted_text`` and build a per-turn assistant loss mask.
@@ -179,6 +169,6 @@ def build_input_ids_and_loss_mask(
 
     The output is *not* padded; the trainer collator handles padding.
     """
-    anchors = get_anchors(chat_template)
-    text = render_conversation(tokenizer, conversation, anchors, apply_chat_template_kwargs)
-    return tokenize_with_assistant_mask(tokenizer, text, anchors, max_length)
+    anchors = _get_anchors(chat_template)
+    text = _render_conversation(tokenizer, conversation, anchors, apply_chat_template_kwargs)
+    return _tokenize_with_assistant_mask(tokenizer, text, anchors, max_length)

@@ -9,7 +9,7 @@
 
 Covers everything except the actual Ray + vLLM + Mooncake spin-up:
 
-* ``data_preprocessing.build_input_ids_and_loss_mask`` matches TorchSpec's
+* ``utils.chat_template_tokenize.build_input_ids_and_loss_mask`` matches TorchSpec's
   ``preprocess_conversations`` byte-for-byte (input_ids and loss_mask).
 * ``ParquetDrafterPretrainDataset`` + ``DrafterPretrainCollator`` produce a
   DataProto whose ``loss_mask`` is non-zero on assistant tokens only.
@@ -77,7 +77,7 @@ def test_loss_mask_matches_torchspec(tokenizer, synthetic_conversations):
     except ImportError:
         pytest.skip("TorchSpec not available")
 
-    from recipe.drafter_cotraining.data_preprocessing import build_input_ids_and_loss_mask
+    from recipe.drafter_cotraining.utils.chat_template_tokenize import build_input_ids_and_loss_mask
 
     for conv in synthetic_conversations:
         ids, mask = build_input_ids_and_loss_mask(tokenizer, conv, "qwen", 8192)
@@ -95,7 +95,7 @@ def test_loss_mask_matches_torchspec(tokenizer, synthetic_conversations):
 
 def test_loss_mask_supervises_every_assistant_turn(tokenizer):
     """Sanity: the per-token mask is 1 on every assistant turn, not just the last."""
-    from recipe.drafter_cotraining.data_preprocessing import build_input_ids_and_loss_mask
+    from recipe.drafter_cotraining.utils.chat_template_tokenize import build_input_ids_and_loss_mask
 
     conv = [
         {"role": "user", "content": "Q1"},
