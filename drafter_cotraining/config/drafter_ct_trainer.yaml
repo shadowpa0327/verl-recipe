@@ -181,6 +181,16 @@ actor_rollout_ref:
       # FSDP2 micro-batching — kernel detaches both target inputs inside
       # the compiled region and the factory is @torch.no_grad() + .detach().
       enable_lazy_target: false
+      # OPTIONAL draft-vocab pruning mapping. Path to a .pt file produced by
+      # ``scripts/data_preprocess/build_vocab_mapping.py`` containing
+      # ``{t2d: bool[V_target], d2t: int64[V_draft]}``. When set, the engine
+      # loads the mapping into the draft model's t2d/d2t buffers (so it ships
+      # with the saved checkpoint) and surfaces t2d to ``prepare_model_inputs``
+      # to slice target logits and build a position_mask. Requires the draft
+      # architecture to declare ``draft_vocab_size`` < ``vocab_size`` — supply
+      # via a template JSON at ``local_path`` above. When null, training runs
+      # on the full target vocab.
+      vocab_mapping_path: null
 
     # FSDP engine config — keys here match FSDPEngineConfig fields. Defaults are
     # sensible for a tiny draft model on 2+ GPUs. Override from CLI if needed.

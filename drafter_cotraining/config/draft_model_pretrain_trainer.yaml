@@ -276,6 +276,17 @@ actor_rollout_ref:
       # lineage reaches the verifier weights.
       enable_lazy_target: false
 
+      # OPTIONAL draft-vocab pruning mapping. Path to a .pt file produced by
+      # ``scripts/data_preprocess/build_vocab_mapping.py`` containing
+      # ``{t2d: bool[V_target], d2t: int64[V_draft]}``. When set, the engine
+      # loads the mapping into the draft model's t2d/d2t buffers (so it ships
+      # with the saved checkpoint) and surfaces t2d to ``prepare_model_inputs``
+      # to slice target logits and build a position_mask. Requires the draft
+      # architecture to declare ``draft_vocab_size`` < ``vocab_size`` — supply
+      # via a template JSON at ``local_path`` above. When null, training runs
+      # on the full target vocab. See claude_docs/vocab-pruning.md.
+      vocab_mapping_path: null
+
     # Drafter FSDP engine config.
     engine_config:
 

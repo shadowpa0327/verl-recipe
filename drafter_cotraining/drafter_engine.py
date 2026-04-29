@@ -88,6 +88,17 @@ class DrafterModelConfig(BaseConfig):
     # Matches TorchSpec's eagle3_trainer load pattern.
     target_model_path: Optional[str] = None
 
+    # Optional draft-vocab pruning mapping — path to a .pt file with
+    # ``{t2d: bool[V_target], d2t: int64[V_draft]}`` produced by
+    # ``scripts/data_preprocess/build_vocab_mapping.py``. When set, the
+    # engine writes the tensors into the draft model's t2d/d2t buffers
+    # (so they ship with checkpoints) and surfaces t2d to
+    # ``prepare_model_inputs`` for slicing target logits to V_draft. The
+    # draft architecture must declare ``draft_vocab_size`` < ``vocab_size``
+    # (via a template JSON at ``local_path``), otherwise the buffers
+    # don't exist and the load fails fast.
+    vocab_mapping_path: Optional[str] = None
+
     # Optional pretrained drafter weights — an HF-format directory matching
     # the ``huggingface/`` layout written by ``save_checkpoint`` (config.json
     # + model.safetensors). When set, ``_build_module`` instantiates the
@@ -425,6 +436,10 @@ class FSDPDrafterEngine(FSDPEngine):
         if target_path:
             self._load_target_frozen_weights(target_path)
 
+        vocab_mapping_path = getattr(self.model_config, "vocab_mapping_path", None)
+        if vocab_mapping_path:
+            self._load_vocab_mapping(vocab_mapping_path)
+
     def _load_target_frozen_weights(self, target_model_path: str):
         """Load target's lm_head + model.norm into engine-owned frozen tensors.
 
@@ -469,6 +484,59 @@ class FSDPDrafterEngine(FSDPEngine):
         logger.info(
             "Loaded target-frozen weights from %s: lm_head=%s, verifier_norm=%s",
             target_model_path, tuple(lm_head_w.shape), tuple(norm_w.shape),
+        )
+
+    def _load_vocab_mapping(self, vocab_mapping_path: str):
+        """Load draft-vocab pruning mapping into the model + engine.
+
+        Two stores must agree:
+          * Underlying draft model's ``t2d``/``d2t`` buffers (used by
+            inference and persisted with the checkpoint) — written via
+            ``set_vocab_buffers`` on the unwrapped draft model.
+          * ``self._t2d_index`` on the engine — used by
+            ``prepare_model_inputs`` to slice target logits to V_draft and
+            build the ``position_mask``. Lives on the current CUDA device
+            so the no-grad target-builder can index without a copy.
+
+        The mapping file is the ``.pt`` written by
+        ``scripts/data_preprocess/build_vocab_mapping.py`` (or any caller
+        of ``vocab_mapping.generate_vocab_mapping_file``). Sanity-checks
+        both shapes against the draft model's configured vocab sizes so
+        a mismatched mapping fails fast instead of silently mis-slicing.
+        """
+        from recipe.drafter_cotraining.vocab_mapping import load_vocab_mapping
+
+        draft_model = self._get_draft_model()
+        if not hasattr(draft_model, "t2d") or not hasattr(draft_model, "d2t"):
+            raise ValueError(
+                "drafter.model_config.vocab_mapping_path is set but the draft "
+                "model has no t2d/d2t buffers. Provide a template at "
+                "model_config.local_path with draft_vocab_size < vocab_size."
+            )
+
+        d2t, t2d = load_vocab_mapping(vocab_mapping_path)
+        if t2d.shape != draft_model.t2d.shape or d2t.shape != draft_model.d2t.shape:
+            raise ValueError(
+                f"Vocab mapping shape mismatch: file has t2d={tuple(t2d.shape)} "
+                f"d2t={tuple(d2t.shape)}, model expects t2d={tuple(draft_model.t2d.shape)} "
+                f"d2t={tuple(draft_model.d2t.shape)}. Rebuild the mapping with "
+                "matching --target_vocab_size / --draft_vocab_size."
+            )
+
+        device = torch.cuda.current_device()
+        # Push to GPU before set_vocab_buffers so the in-place .copy_ stays
+        # on-device when the registered buffer was placed on GPU by FSDP.
+        d2t_dev = d2t.to(device=device)
+        t2d_dev = t2d.to(device=device)
+        draft_model.set_vocab_buffers(d2t=d2t_dev, t2d=t2d_dev)
+
+        # Engine-side reference for prepare_model_inputs. Keep on GPU; the
+        # target builder indexes into target_lm_head_weight using this.
+        self._t2d_index = t2d_dev
+
+        logger.info(
+            "Loaded vocab mapping from %s: V_target=%d, V_draft=%d",
+            vocab_mapping_path, int(t2d.numel()), int(t2d.sum()),
         )
 
     # ------------------------------------------------------------------
@@ -624,8 +692,10 @@ class FSDPDrafterEngine(FSDPEngine):
 
         eagle3 = self.module.module if hasattr(self.module, "module") else self.module
 
-        # No vocab pruning today — t2d=None falls into the no-pruning branch.
-        # When pruning is added later, surface t2d via _t2d_index.
+        # Vocab pruning: _t2d_index is set by _load_vocab_mapping when the
+        # recipe config provides drafter.model_config.vocab_mapping_path.
+        # When unset, t2d=None and compute_target_p_padded falls into the
+        # no-pruning branch (V_full softmax, no position_mask).
         t2d = getattr(self, "_t2d_index", None)
 
         # Lazy target builder is only meaningful in the no-pruning regime; the
