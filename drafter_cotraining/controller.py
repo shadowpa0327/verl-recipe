@@ -35,6 +35,7 @@ class SequenceMeta:
 
     input_ids: Any  # np.ndarray or torch.Tensor, shape [seq_len]
     attention_mask: Any  # np.ndarray or torch.Tensor, shape [seq_len]
+    loss_mask: Any  # np.ndarray or torch.Tensor of int64, shape [seq_len]
     prompt_len: int = 0
     response_len: int = 0
 
@@ -45,20 +46,19 @@ class SampleMeta:
     Lightweight — lives in Level 2 (sample_pool) on the driver.
     Actual tensors (hidden states) are in Mooncake, referenced by key.
 
-    ``prompt_len`` and ``response_len`` are the unpadded valid lengths of
-    each span in the stored Mooncake tokens (total length = prompt + response).
-    Consumed by ``update_drafter`` to build a response-only
-    ``loss_mask = [0]*prompt_len + [1]*(response_len - 1)`` (final response
-    position dropped — no valid next-token target).
+    ``loss_mask`` is the per-token supervision mask for the prefilled
+    sequence — 1 on every assistant content token, 0 elsewhere (matches
+    TorchSpec ``preprocess_conversations``). Required: callers must compute
+    the mask upstream and hand it in here. The drafter worker uses it
+    directly when building the per-rank batch from Mooncake tensors.
     """
 
     mooncake_key: str
     shapes: Dict[str, Tuple[int, ...]]
     dtypes: Dict[str, Any]  # torch.dtype stored as string for serialization
+    loss_mask: Any  # np.ndarray of int64, shape [seq_len]
     seq_len: int = 0
     n_tokens: int = 0
-    prompt_len: int = 0
-    response_len: int = 0
 
 
 class DrafterDataController:
@@ -141,6 +141,22 @@ class DrafterDataController:
         n = len(self._sample_pool)
         logger.debug("drain_as_dataproto: packing %d samples into DataProto", n)
 
+        # Per-sample loss masks vary in length, so they must live in an
+        # object-dtype array (one np.ndarray of int64 per sample). DataProto's
+        # mesh dispatch uses np.array_split on axis 0, which is happy with
+        # object arrays — every per-sample row is sliced as a Python object.
+        loss_masks_obj = np.empty(n, dtype=object)
+        for i, m in enumerate(self._sample_pool):
+            if m.loss_mask is None:
+                raise ValueError(
+                    f"SampleMeta {i} (key={m.mooncake_key!r}) has loss_mask=None; "
+                    "the drafter pipeline requires a per-token assistant mask."
+                )
+            if isinstance(m.loss_mask, np.ndarray):
+                loss_masks_obj[i] = m.loss_mask.astype(np.int64).reshape(-1)
+            else:
+                loss_masks_obj[i] = np.asarray(m.loss_mask, dtype=np.int64).reshape(-1)
+
         proto = DataProto(
             non_tensor_batch={
                 'mooncake_keys': np.array(
@@ -153,17 +169,12 @@ class DrafterDataController:
                     [m.dtypes for m in self._sample_pool], dtype=object
                 ),
                 'seq_lens': np.array(
-                    [m.seq_len for m in self._sample_pool], dtype=object
+                    [m.seq_len for m in self._sample_pool], dtype=np.int64
                 ),
                 'n_tokens': np.array(
-                    [m.n_tokens for m in self._sample_pool], dtype=object
+                    [m.n_tokens for m in self._sample_pool], dtype=np.int64
                 ),
-                'prompt_lens': np.array(
-                    [m.prompt_len for m in self._sample_pool], dtype=object
-                ),
-                'response_lens': np.array(
-                    [m.response_len for m in self._sample_pool], dtype=object
-                ),
+                'loss_masks': loss_masks_obj,
             },
         )
 

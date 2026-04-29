@@ -223,9 +223,10 @@ class ActorRolloutRefDrafterWorker(ActorRolloutRefWorker):
             return DataProto(non_tensor_batch=data.non_tensor_batch)
 
         # ── Step 1: metadata-only empty-mask filter (TorchSpec data_fetcher.py:177)
-        response_lens = data.non_tensor_batch.get("response_lens", [])
-        if len(response_lens) > 0:
-            keep = [int(r) - 1 > 0 for r in response_lens]
+        loss_masks = data.non_tensor_batch.get("loss_masks", None)
+        valid_counts = self._compute_valid_counts(data)
+        if loss_masks is not None and len(loss_masks) > 0:
+            keep = [v > 0 for v in valid_counts]
             n_dropped = sum(1 for k in keep if not k)
             if n_dropped > 0:
                 logger.warning(
@@ -250,14 +251,14 @@ class ActorRolloutRefDrafterWorker(ActorRolloutRefWorker):
                 kept_indices = [i for i, k in enumerate(keep) if k]
                 data = self._select_data_indices(data, kept_indices)
                 mooncake_keys = data.non_tensor_batch.get("mooncake_keys", [])
-                response_lens = data.non_tensor_batch.get("response_lens", [])
+                valid_counts = self._compute_valid_counts(data)
 
         if len(mooncake_keys) == 0:
             logger.warning("[drafter rank=%d] all samples filtered; skipping macro-step", rank)
             return DataProto(non_tensor_batch=data.non_tensor_batch)
 
         # ── Step 2: preflight total_valid_global from metadata (no fetch needed)
-        local_total_valid = sum(max(0, int(r) - 1) for r in response_lens)
+        local_total_valid = int(sum(valid_counts))
         total_valid_global = self._allreduce_sum_int(local_total_valid)
         if total_valid_global == 0:
             logger.warning("[drafter rank=%d] total_valid_global=0; skipping", rank)
@@ -268,9 +269,8 @@ class ActorRolloutRefDrafterWorker(ActorRolloutRefWorker):
         # cache doesn't fragment per-rank. Also keeps the resulting
         # train_metrics dict bitwise-equal across ranks (verl's DataProto.concat
         # asserts on conflicting meta_info values).
-        prompt_lens = data.non_tensor_batch.get("prompt_lens", [0] * len(mooncake_keys))
-        seq_lens = [int(p) + int(r) for p, r in zip(prompt_lens, response_lens)]
-        local_t_pad = max(seq_lens) if seq_lens else 0
+        seq_lens_list = data.non_tensor_batch.get("seq_lens", [])
+        local_t_pad = int(max(seq_lens_list)) if len(seq_lens_list) > 0 else 0
         t_pad_macro = self._allreduce_max_int(local_t_pad)
 
         # ── Step 4-5: micro-batch loop + optimizer step
@@ -339,6 +339,13 @@ class ActorRolloutRefDrafterWorker(ActorRolloutRefWorker):
     ):
         """Fetch tensors for the keys in `data` and collate to a rectangular batch.
 
+        Reads the per-token assistant loss_mask out of
+        ``data.non_tensor_batch['loss_masks']`` (one ``np.ndarray`` per
+        sample, matching the prefilled token sequence) and aligns it to the
+        Mooncake-returned ``input_ids`` length. This replaces the older
+        prompt+response-derived mask path; we now supervise every assistant
+        content token across all turns (TorchSpec semantics).
+
         t_pad_override: when provided, collator pads to at least this length
             (still snapped to a 256-token bucket). Lets the macro-step
             pre-compute T_pad once across all micro-batches so torch.compile
@@ -347,8 +354,13 @@ class ActorRolloutRefDrafterWorker(ActorRolloutRefWorker):
         mooncake_keys = data.non_tensor_batch.get("mooncake_keys", [])
         shapes_list = data.non_tensor_batch.get("shapes", [])
         dtypes_list = data.non_tensor_batch.get("dtypes", [])
-        prompt_lens = data.non_tensor_batch.get("prompt_lens", [])
-        response_lens = data.non_tensor_batch.get("response_lens", [])
+        loss_masks = data.non_tensor_batch.get("loss_masks", None)
+        if loss_masks is None or len(loss_masks) != len(mooncake_keys):
+            raise KeyError(
+                "DataProto.non_tensor_batch must carry 'loss_masks' aligned 1:1 "
+                "with 'mooncake_keys'; the drafter pipeline supervises only "
+                "the assistant tokens identified by this mask."
+            )
 
         store = self._get_mooncake_store(data.meta_info.get("mooncake_cfg", {}), rank)
         if store is None:
@@ -372,23 +384,31 @@ class ActorRolloutRefDrafterWorker(ActorRolloutRefWorker):
             # Add batch dim — collator expects [1, T] / [1, T, D] per sample.
             ids = out.input_ids.unsqueeze(0) if out.input_ids.dim() == 1 else out.input_ids
             hs = out.hidden_states.unsqueeze(0) if out.hidden_states.dim() == 2 else out.hidden_states
-            # Response-only loss mask — zeros on prompt positions, ones on
-            # response positions EXCEPT the last (next-token prediction has no
-            # valid target at the final response position; matches TorchSpec
-            # sgl_engine_decode.py:249 `completion_tokens - 1` and the
-            # `loss_mask[0, -1] = 0` in preprocessing.py:329-331). When either
-            # length is missing we fall back to all-ones so the engine still
-            # runs (degraded signal).
             seq_len = int(ids.shape[-1])
-            plen = int(prompt_lens[i]) if i < len(prompt_lens) else 0
-            rlen = int(response_lens[i]) if i < len(response_lens) else 0
-            if rlen > 1:
-                loss_mask = torch.zeros_like(ids).long()
-                # rlen-1 ones: positions [plen, plen+rlen-1) — drops the last.
-                end = min(plen + rlen - 1, seq_len)
-                loss_mask[..., plen:end] = 1
+
+            # Trainer-supplied per-token assistant mask. seq_len here is what
+            # Mooncake actually returned (same as the prefill input length),
+            # so we just truncate / right-pad with zeros to match.
+            raw_mask = loss_masks[i]
+            if raw_mask is None:
+                raise ValueError(
+                    f"loss_masks[{i}] is None for key={key!r}; "
+                    "per-sample mask is required."
+                )
+            if isinstance(raw_mask, torch.Tensor):
+                mask_np = raw_mask.detach().cpu().numpy().astype(np.int64).reshape(-1)
+            elif isinstance(raw_mask, np.ndarray):
+                mask_np = raw_mask.astype(np.int64).reshape(-1)
             else:
-                loss_mask = torch.ones_like(ids).long()
+                mask_np = np.asarray(raw_mask, dtype=np.int64).reshape(-1)
+            if mask_np.shape[0] >= seq_len:
+                mask_np = mask_np[:seq_len]
+            else:
+                fixed = np.zeros(seq_len, dtype=np.int64)
+                fixed[: mask_np.shape[0]] = mask_np
+                mask_np = fixed
+            loss_mask = torch.from_numpy(mask_np).long().to(ids.device).unsqueeze(0)
+
             feat = {
                 "input_ids": ids,
                 "hidden_states": hs,
@@ -425,6 +445,31 @@ class ActorRolloutRefDrafterWorker(ActorRolloutRefWorker):
         print("=" * 100)
 
     # ── Micro-batch helpers ──────────────────────────────────
+
+    def _compute_valid_counts(self, data: DataProto) -> List[int]:
+        """Per-sample count of supervised positions (loss_mask sum).
+
+        Used as the empty-mask filter and as the per-mb / total scale divisor.
+        Required: ``data.non_tensor_batch['loss_masks']`` must be present —
+        the upstream pipeline always sets it, and there's no sensible
+        fallback for the macro-step divisor.
+        """
+        loss_masks = data.non_tensor_batch.get("loss_masks", None)
+        if loss_masks is None:
+            raise KeyError(
+                "DataProto.non_tensor_batch is missing required key 'loss_masks'."
+            )
+        counts: List[int] = []
+        for i, lm in enumerate(loss_masks):
+            if lm is None:
+                raise ValueError(f"loss_masks[{i}] is None; per-sample mask is required.")
+            if isinstance(lm, np.ndarray):
+                counts.append(int(lm.astype(np.int64).sum()))
+            elif isinstance(lm, torch.Tensor):
+                counts.append(int(lm.long().sum().item()))
+            else:
+                counts.append(int(np.asarray(lm, dtype=np.int64).sum()))
+        return counts
 
     def _allreduce_sum_int(self, value: int) -> int:
         """All-reduce SUM of a Python int across the drafter DP group."""
@@ -861,6 +906,7 @@ class DrafterPretrainWorker(Worker):
     _fetch_drafter_batch_from_mooncake = ActorRolloutRefDrafterWorker._fetch_drafter_batch_from_mooncake
     _log_drafter_batch_shapes = ActorRolloutRefDrafterWorker._log_drafter_batch_shapes
     # Micro-batch helpers (Phase C):
+    _compute_valid_counts = ActorRolloutRefDrafterWorker._compute_valid_counts
     _allreduce_sum_int = ActorRolloutRefDrafterWorker._allreduce_sum_int
     _allreduce_max_int = ActorRolloutRefDrafterWorker._allreduce_max_int
     _select_data_indices = ActorRolloutRefDrafterWorker._select_data_indices

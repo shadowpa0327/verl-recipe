@@ -32,20 +32,24 @@ pretrain:
   # Save a final drafter checkpoint at the last completed step.
   save_final: True
 
-# Drafter pretrain data. Parquet files contain explicit prompt/response columns.
+# Drafter pretrain data. Parquet files contain canonical multi-turn conversations.
 data:
 
-  # Training parquet emitted by scripts/data_preprocess/qwen3_8b_eagle3.py.
+  # Training parquet emitted by scripts/data_preprocess/jsonl_to_parquet.py.
   train_files: ~/data/qwen3_8b_eagle3/train.parquet
 
-  # Evaluation parquet emitted by scripts/data_preprocess/qwen3_8b_eagle3.py.
+  # Evaluation parquet emitted by scripts/data_preprocess/jsonl_to_parquet.py.
   eval_files: ~/data/qwen3_8b_eagle3/test.parquet
 
-  # The field containing prompt messages before the target response.
-  prompt_messages_key: prompt_messages
+  # Column containing the canonical conversation list of {role, content} dicts.
+  conversations_key: conversations
 
-  # The field containing the target assistant response text.
-  response_key: response
+  # Column containing a per-row id string (used for tracing only).
+  id_key: id
+
+  # Chat-template name used to anchor assistant spans for the loss mask.
+  # See recipe/drafter_cotraining/data_preprocessing.py for the registry.
+  chat_template: qwen
 
   # Trust Qwen tokenizer/processor remote code by default for this pretrain dataset.
   trust_remote_code: True
@@ -56,11 +60,10 @@ data:
   # Drafter pretrain batch size.
   train_batch_size: 8
 
-  # Prompt window used by the DataProto builder.
-  max_prompt_length: 512
-
-  # Response window used by the DataProto builder.
-  max_response_length: 512
+  # Hard cap on tokens per row (truncated by the tokenizer; partial assistant
+  # turns past this cap contribute their surviving prefix). Replaces the older
+  # max_prompt_length / max_response_length pair.
+  max_seq_length: 1024
 
   # Extra tokenizer.apply_chat_template kwargs.
   apply_chat_template_kwargs: {}
@@ -123,7 +126,8 @@ hs_collector:
     # Pipeline parallel size.
     pipeline_model_parallel_size: 1
 
-    # Must be greater than max_prompt_length + max_response_length.
+    # Must be strictly greater than data.max_seq_length (collector prefills
+    # the full conversation plus a max_tokens=1 sample).
     max_model_len: 1056
 
     # vLLM memory fraction for the collector.
@@ -187,7 +191,7 @@ hs_collector:
             hf_config:
 
               # Qwen3-8B has 36 hidden layers; [2, n/2, n-3] & last hidden states.
-              eagle_aux_hidden_state_layer_ids: [2, 18, 33, 35]
+              eagle_aux_hidden_state_layer_ids: [2, 18, 33, 36]
 
 # Drafter training lives under actor_rollout_ref because
 # ActorRolloutRefDrafterWorker receives this subconfig.

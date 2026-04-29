@@ -209,16 +209,28 @@ class MooncakeMaster:
             env["MC_USE_IPV6"] = "1"
             logger.info("Starting mooncake master in IPv6-only mode (P2PHANDSHAKE, port=%s)", port)
         else:
+            # The mooncake_master binary always tries to bind ``--metrics_port``
+            # (default 9003), even with ``--enable_metric_reporting=false``;
+            # if that port is held by a stale master, the new process exits 1.
+            # Bind ``metrics_port`` to ``rpc_port + 1`` so the address is
+            # always co-derived with the user-chosen rpc port and never
+            # collides with another verl run.
+            metrics_port = int(port) + 1
             cmd = [
                 mooncake_bin,
                 f"--rpc_port={port}",
                 f"--http_metadata_server_port={http_port}",
                 f"--http_metadata_server_host={http_host}",
                 "--enable_http_metadata_server=true",
+                "--enable_metric_reporting=false",
+                f"--metrics_port={metrics_port}",
                 f"--default_kv_lease_ttl={int(kv_lease_ttl_s * 1000)}",
             ]
             env = os.environ.copy()
-            logger.info("Starting mooncake master (grpc_port=%s, http_port=%s)", port, http_port)
+            logger.info(
+                "Starting mooncake master (grpc_port=%s, http_port=%s, metrics_port=%s)",
+                port, http_port, metrics_port,
+            )
 
         self._process = subprocess.Popen(
             cmd,

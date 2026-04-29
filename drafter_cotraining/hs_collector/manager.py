@@ -60,16 +60,26 @@ class AsyncHSCollectorServerManager(AsyncLLMServerManager):
         }
 
     async def compute_hidden_states_batch(self, data: DataProto) -> DataProto:
-        """Run prefill-only on each sample in `data`. Returns a DataProto with mooncake metadata."""
+        """Run prefill-only on each sample in `data`. Returns a DataProto with mooncake metadata.
+
+        Pulls the per-sample loss_mask the trainer prepared (in
+        ``data.non_tensor_batch['loss_masks']``) and forwards it unchanged
+        in the output non_tensor_batch under ``hs_loss_masks``. The drafter
+        worker reads that mask back when building the per-rank training
+        batch — every assistant content token is supervised (1), everything
+        else is 0. See ``recipe/drafter_cotraining/data_preprocessing.py``.
+        """
         tasks = []
-        prompt_lens: list[int] = []
-        response_lens: list[int] = []
+        loss_masks: list[np.ndarray] = []
         for i in range(len(data)):
-            sequence_ids, plen, rlen = _unpad_sequence_ids(data[i : i + 1])
-            prompt_lens.append(plen)
-            response_lens.append(rlen)
+            sequence_ids, lm = _unpad_sequence_and_mask(data[i : i + 1])
+            loss_masks.append(lm)
             tasks.append(asyncio.create_task(self.compute_hidden_states_single(sequence_ids)))
         results = await asyncio.gather(*tasks)
+
+        loss_masks_obj = np.empty(len(loss_masks), dtype=object)
+        for i, lm in enumerate(loss_masks):
+            loss_masks_obj[i] = lm
 
         return DataProto(
             non_tensor_batch={
@@ -77,28 +87,53 @@ class AsyncHSCollectorServerManager(AsyncLLMServerManager):
                 "hs_shapes": np.array([r["shapes"] for r in results], dtype=object),
                 "hs_dtypes": np.array([r["dtypes"] for r in results], dtype=object),
                 "hs_seq_lens": np.array([r["seq_len"] for r in results], dtype=np.int64),
-                # Valid (unpadded) prompt / response lengths per sample. Feeds the
-                # drafter-side response-only loss_mask = [0]*prompt_len +
-                # [1]*(response_len - 1) (final response position dropped — no
-                # valid next-token target). Matches TorchSpec assistant-content
-                # mask semantics + sgl_engine_decode.py:249 completion_tokens-1.
-                "hs_prompt_lens": np.array(prompt_lens, dtype=np.int64),
-                "hs_response_lens": np.array(response_lens, dtype=np.int64),
+                # Per-token assistant supervision mask, length = seq_len.
+                # Carried through as object-dtype because seq_len varies across
+                # samples (no rectangular tensor possible without padding).
+                "hs_loss_masks": loss_masks_obj,
             },
         )
 
 
-def _unpad_sequence_ids(data: DataProto) -> tuple[list[int], int, int]:
-    """Extract (valid_tokens, prompt_len, response_len) from a single sample.
+def _unpad_sequence_and_mask(data: DataProto) -> tuple[list[int], np.ndarray]:
+    """Slice a single right-padded row down to its valid prefix.
 
-    Left-padded prompt concatenated with right-padded response, same layout as teacher.
-    Returned token list has length ``prompt_len + response_len``.
+    Required schema (produced by ``DrafterPretrainCollator``):
+
+    * ``data.batch["input_ids"]``  — ``[1, T_pad]`` right-padded with pad token
+    * ``data.batch["attention_mask"]`` — ``[1, T_pad]``, 1 on real tokens
+    * ``data.non_tensor_batch["loss_masks"][0]`` — ``np.ndarray`` of int64,
+      length equals the sample's valid token count, 1 on every supervised
+      (assistant content) position
+
+    The per-token loss mask is *required*: callers must compute it upstream
+    and hand it through. Missing or length-mismatched masks raise — the
+    drafter pipeline supervises real assistant content only and silently
+    falling back to all-ones / response-only would corrupt the loss.
+
+    Returns ``(tokens, mask)``: raw token list and the int64 mask, both of
+    length ``seq_len = attention_mask.sum()``.
     """
     input_ids = data.batch["input_ids"][0]
     attention_mask = data.batch["attention_mask"][0]
-    prompt_width = data.batch["prompts"][0].shape[0]
-    valid_prompt_length = int(attention_mask[:prompt_width].sum().item())
-    valid_response_length = int(attention_mask[-data.batch["responses"][0].shape[0] :].sum().item())
-    prompt_pad = prompt_width - valid_prompt_length
-    tokens = input_ids[prompt_pad : prompt_width + valid_response_length].tolist()
-    return tokens, valid_prompt_length, valid_response_length
+    seq_len = int(attention_mask.sum().item())
+    tokens = input_ids[:seq_len].tolist()
+
+    nt = data.non_tensor_batch
+    if "loss_masks" not in nt:
+        raise KeyError(
+            "DataProto.non_tensor_batch is missing required key 'loss_masks'. "
+            "The drafter pipeline requires a per-sample assistant loss_mask "
+            "produced upstream (see DrafterPretrainCollator)."
+        )
+    raw = nt["loss_masks"][0]
+    if isinstance(raw, np.ndarray):
+        mask = raw.astype(np.int64).reshape(-1)
+    else:
+        mask = np.asarray(raw, dtype=np.int64).reshape(-1)
+    if mask.shape[0] != seq_len:
+        raise ValueError(
+            f"loss_masks[0] has length {mask.shape[0]} but sample has "
+            f"{seq_len} valid tokens; lengths must match exactly."
+        )
+    return tokens, mask

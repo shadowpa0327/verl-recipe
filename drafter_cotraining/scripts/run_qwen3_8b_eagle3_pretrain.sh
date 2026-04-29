@@ -46,25 +46,23 @@ cd "$VERL_ROOT"
     --config-name draft_model_pretrain_trainer \
     data.train_files="['$TRAIN_FILE']" \
     data.eval_files="['$VAL_FILE']" \
-    data.train_batch_size=4 \
-    data.val_batch_size=4 \
-    data.max_prompt_length=4096 \
-    data.max_response_length=2048 \
+    data.train_batch_size=16 \
+    data.val_batch_size=16 \
+    data.max_seq_length=4096 \
+    data.chat_template=qwen \
     actor_rollout_ref.model.path="$MODEL_PATH" \
-    actor_rollout_ref.drafter.optimizer_config.lr=1.0e-4 \
+    actor_rollout_ref.drafter.optimizer_config.lr=2.0e-4 \
     actor_rollout_ref.drafter.optimizer_config.lr_warmup_steps_ratio=0.015 \
     actor_rollout_ref.drafter.optimizer_config.clip_grad=0.5 \
     actor_rollout_ref.drafter.model_config.attention_backend="$ATTENTION_BACKEND" \
     hs_collector.inference.max_model_len=6176 \
-    hs_collector.inference.gpu_memory_utilization=0.3 \
-    hs_collector.inference.engine_kwargs.vllm.speculative_config.draft_model_config.hf_config.eagle_aux_hidden_state_layer_ids='[1,17,32,35]' \
+    hs_collector.inference.gpu_memory_utilization=0.5 \
     pretrain.val_max_batches=-1 \
     trainer.logger='["console"]' \
-    trainer.n_gpus_per_node=2 \
+    trainer.n_gpus_per_node=4 \
     trainer.nnodes=1 \
     trainer.save_freq=-1 \
     trainer.test_freq=-1 \
-    trainer.total_epochs=1 \
-    trainer.total_training_steps=1000 \
+    trainer.total_epochs=5 \
     trainer.val_before_train=false \
     "$@"

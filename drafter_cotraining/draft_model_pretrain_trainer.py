@@ -14,13 +14,18 @@
 """Draft-model pretraining.
 
 This trainer keeps the drafter pretrain path separate from PPO/co-training.
-Each parquet row is an explicit supervised pair:
+Each parquet row is a full multi-turn conversation in canonical form:
 
-    prompt_messages + response
-        -> DataProto(prompts, responses, input_ids, masks)
-        -> HS collector
-        -> Mooncake sample metadata
+    {"id": ..., "conversations": [{"role": ..., "content": ...}, ...]}
+        -> DataProto(input_ids, attention_mask, position_ids, loss_mask)
+        -> HS collector (prefill the full sequence, capture hidden states)
+        -> Mooncake sample metadata + per-sample loss_mask
         -> DrafterPretrainWorker.update_drafter
+
+Loss mask semantics (ported from TorchSpec ``preprocess_conversations``):
+every assistant content token is supervised (loss_mask=1); user/system/tool
+tokens are 0. Truncation past ``data.max_seq_length`` is implicit — partial
+assistant turns contribute their surviving prefix.
 
 It reuses the existing Ray worker, HS collector, Mooncake, and EAGLE drafter
 training implementation, but the fit loop is a plain supervised pretrain loop.
@@ -59,34 +64,72 @@ DRAFTER_ROLE = "drafter"
 
 
 def _sample_metas_from_hs_batch(hs_batch: DataProto) -> list[SampleMeta]:
+    """Build SampleMeta list from the HS-collector output DataProto.
+
+    The collector returns per-sample Mooncake key + shape/dtype metadata plus
+    the per-token loss mask the trainer prepared (carried through unchanged
+    so the supervisor positions stay aligned with the prefilled tokens).
+    Both ``hs_mooncake_keys`` and ``hs_loss_masks`` are required.
+    """
     nt = hs_batch.non_tensor_batch
     if not nt or "hs_mooncake_keys" not in nt:
         return []
     keys = nt["hs_mooncake_keys"]
-    prompt_lens = nt.get("hs_prompt_lens")
-    response_lens = nt.get("hs_response_lens")
-    return [
-        SampleMeta(
-            mooncake_key=str(keys[i]),
-            shapes=nt["hs_shapes"][i] if isinstance(nt["hs_shapes"][i], dict) else {},
-            dtypes=nt["hs_dtypes"][i] if isinstance(nt["hs_dtypes"][i], dict) else {},
-            seq_len=int(nt["hs_seq_lens"][i]),
-            n_tokens=int(nt["hs_seq_lens"][i]),
-            prompt_len=int(prompt_lens[i]) if prompt_lens is not None else 0,
-            response_len=int(response_lens[i]) if response_lens is not None else 0,
+    if "hs_loss_masks" not in nt:
+        raise KeyError(
+            "HS-collector output is missing required key 'hs_loss_masks'."
         )
-        for i in range(len(keys))
-    ]
+    loss_masks = nt["hs_loss_masks"]
+    metas: list[SampleMeta] = []
+    for i in range(len(keys)):
+        seq_len = int(nt["hs_seq_lens"][i])
+        lm = loss_masks[i]
+        if lm is None:
+            raise ValueError(f"hs_loss_masks[{i}] is None for key {keys[i]!r}.")
+        mask_arr = (
+            lm.astype(np.int64).reshape(-1)
+            if isinstance(lm, np.ndarray)
+            else np.asarray(lm, dtype=np.int64).reshape(-1)
+        )
+        # Defensive: clip / pad to seq_len so downstream code can assume the
+        # mask is exactly seq_len long. Length mismatches indicate a producer
+        # bug but shouldn't crash the trainer mid-step.
+        if mask_arr.shape[0] != seq_len:
+            fixed = np.zeros(seq_len, dtype=np.int64)
+            n = min(mask_arr.shape[0], seq_len)
+            fixed[:n] = mask_arr[:n]
+            mask_arr = fixed
+        metas.append(
+            SampleMeta(
+                mooncake_key=str(keys[i]),
+                shapes=nt["hs_shapes"][i] if isinstance(nt["hs_shapes"][i], dict) else {},
+                dtypes=nt["hs_dtypes"][i] if isinstance(nt["hs_dtypes"][i], dict) else {},
+                loss_mask=mask_arr,
+                seq_len=seq_len,
+                n_tokens=seq_len,
+            )
+        )
+    return metas
 
 
 class ParquetDrafterPretrainDataset(Dataset):
-    """Read explicit prompt/response drafter pretrain rows from parquet."""
+    """Read canonical multi-turn conversation rows from parquet.
+
+    Expected schema (produced by ``scripts/data_preprocess/jsonl_to_parquet.py``):
+
+        id:            string
+        conversations: list<struct<role: string, content: string>>
+
+    The dataset returns ``(id, conversations)`` per row; tokenization and
+    loss-mask construction happen in the collator so the dataset can stay
+    cheap and tokenizer-free.
+    """
 
     def __init__(
         self,
         data_files,
-        prompt_messages_key: str = "prompt_messages",
-        response_key: str = "response",
+        conversations_key: str = "conversations",
+        id_key: str = "id",
         max_samples: int = -1,
     ):
         import pandas as pd
@@ -97,20 +140,21 @@ class ParquetDrafterPretrainDataset(Dataset):
         if not isinstance(data_files, list | ListConfig):
             data_files = [data_files]
 
-        samples: list[tuple[list[dict[str, str]], str]] = []
+        samples: list[tuple[str, list[dict[str, str]]]] = []
         for data_file in data_files:
             local_path = copy_local_path_from_hdfs(data_file, verbose=True)
             dataframe = pd.read_parquet(local_path, dtype_backend="pyarrow")
-            missing = [k for k in (prompt_messages_key, response_key) if k not in dataframe.columns]
-            if missing:
-                raise ValueError(f"{local_path} is missing required column(s): {missing}")
+            if conversations_key not in dataframe.columns:
+                raise ValueError(
+                    f"{local_path} is missing required column {conversations_key!r}"
+                )
 
-            for _, row in dataframe.iterrows():
-                prompt_messages = convert_nested_value_to_list_recursive(row[prompt_messages_key])
-                response = row[response_key]
-                if not isinstance(response, str):
+            for idx, row in dataframe.iterrows():
+                conv = convert_nested_value_to_list_recursive(row[conversations_key])
+                if not isinstance(conv, list) or not conv:
                     continue
-                samples.append((prompt_messages, response))
+                row_id = str(row[id_key]) if id_key in dataframe.columns else f"{idx}"
+                samples.append((row_id, conv))
                 if max_samples > 0 and len(samples) >= max_samples:
                     break
             if max_samples > 0 and len(samples) >= max_samples:
@@ -123,125 +167,123 @@ class ParquetDrafterPretrainDataset(Dataset):
     def __len__(self) -> int:
         return len(self.samples)
 
-    def __getitem__(self, index: int) -> tuple[list[dict[str, str]], str]:
+    def __getitem__(self, index: int) -> tuple[str, list[dict[str, str]]]:
         return self.samples[index]
 
 
-def _tokenize_prompt_response(
-    tokenizer,
-    prompt_msgs: list[dict[str, Any]],
-    response_text: str,
-    max_prompt_len: int,
-    max_response_len: int,
-    apply_chat_template_kwargs: dict[str, Any],
-) -> tuple[list[int], list[int]]:
-    prompt_text = tokenizer.apply_chat_template(
-        prompt_msgs,
-        add_generation_prompt=True,
-        tokenize=False,
-        **apply_chat_template_kwargs,
-    )
-    prompt_ids = tokenizer(prompt_text, add_special_tokens=False)["input_ids"]
-    response_ids = tokenizer(response_text, add_special_tokens=False)["input_ids"]
-
-    if len(prompt_ids) > max_prompt_len:
-        prompt_ids = prompt_ids[-max_prompt_len:]
-    if len(response_ids) > max_response_len:
-        response_ids = response_ids[:max_response_len]
-    return list(prompt_ids), list(response_ids)
-
-
-def _pad_batch_to_dataproto(
-    samples: list[tuple[list[int], list[int]]],
+def _build_pretrain_dataproto(
+    samples: list[tuple[str, torch.Tensor, torch.Tensor]],
     pad_token_id: int,
-    prompt_length: int,
-    response_length: int,
+    max_seq_length: int,
 ) -> DataProto:
+    """Right-pad input_ids/attention_mask/loss_mask to ``max_seq_length`` and
+    pack into a ``DataProto`` shaped ``[B, T]``.
+
+    Includes ``seq_lens`` (per-sample valid token count) in the non-tensor
+    batch so downstream consumers can slice off padding without re-summing
+    the attention mask. Carries ``loss_masks`` per sample as a list-of-arrays
+    in the non-tensor batch — these are forwarded through HS collection back
+    to the drafter, which uses them to set up per-turn supervision.
+    """
     batch_size = len(samples)
-    prompts = torch.full((batch_size, prompt_length), pad_token_id, dtype=torch.long)
-    prompt_mask = torch.zeros((batch_size, prompt_length), dtype=torch.long)
-    responses = torch.full((batch_size, response_length), pad_token_id, dtype=torch.long)
-    response_mask = torch.zeros((batch_size, response_length), dtype=torch.long)
+    input_ids = torch.full((batch_size, max_seq_length), pad_token_id, dtype=torch.long)
+    attention_mask = torch.zeros((batch_size, max_seq_length), dtype=torch.long)
+    loss_mask = torch.zeros((batch_size, max_seq_length), dtype=torch.long)
+    seq_lens = np.zeros(batch_size, dtype=np.int64)
+    loss_masks_obj = np.empty(batch_size, dtype=object)
+    uids = np.empty(batch_size, dtype=object)
 
-    for i, (prompt_ids, response_ids) in enumerate(samples):
-        prompt_len = len(prompt_ids)
-        response_len = len(response_ids)
-        if prompt_len > 0:
-            prompts[i, -prompt_len:] = torch.tensor(prompt_ids, dtype=torch.long)
-            prompt_mask[i, -prompt_len:] = 1
-        if response_len > 0:
-            responses[i, :response_len] = torch.tensor(response_ids, dtype=torch.long)
-            response_mask[i, :response_len] = 1
+    for i, (uid, ids, mask) in enumerate(samples):
+        n = ids.shape[0]
+        n = min(n, max_seq_length)
+        input_ids[i, :n] = ids[:n]
+        attention_mask[i, :n] = 1
+        loss_mask[i, :n] = mask[:n]
+        seq_lens[i] = n
+        loss_masks_obj[i] = mask[:n].numpy().astype(np.int64)
+        uids[i] = uid
 
-    input_ids = torch.cat([prompts, responses], dim=1)
-    attention_mask = torch.cat([prompt_mask, response_mask], dim=1)
-    position_ids = (attention_mask.cumsum(dim=1) - 1).clamp(min=0)
-    position_ids = position_ids * attention_mask
+    position_ids = (attention_mask.cumsum(dim=1) - 1).clamp(min=0) * attention_mask
 
-    batch = DataProto.from_single_dict(
+    proto = DataProto.from_single_dict(
         {
-            "prompts": prompts,
-            "responses": responses,
             "input_ids": input_ids,
             "attention_mask": attention_mask,
             "position_ids": position_ids,
-            "response_mask": response_mask,
+            "loss_mask": loss_mask,
         }
     )
-    batch.non_tensor_batch["uid"] = np.array(
-        [str(uuid.uuid4()) for _ in range(batch_size)], dtype=object
-    )
-    return batch
+    proto.non_tensor_batch["uid"] = uids
+    proto.non_tensor_batch["seq_lens"] = seq_lens
+    proto.non_tensor_batch["loss_masks"] = loss_masks_obj
+    return proto
 
 
 class DrafterPretrainCollator:
+    """Render → tokenize → build per-turn assistant loss mask → pack to DataProto.
+
+    The collator owns the tokenizer because the per-row work depends on the
+    chat template registered by the user. It drops rows that produce a
+    zero-supervision mask (matches TorchSpec's ``min_loss_tokens`` filter at
+    a min of 1) so the macro-step doesn't waste a slot on a row the drafter
+    can't learn from.
+    """
+
     def __init__(
         self,
         tokenizer,
-        max_prompt_len: int,
-        max_response_len: int,
+        max_seq_length: int,
+        chat_template: str,
         apply_chat_template_kwargs: dict[str, Any] | None = None,
     ):
+        from recipe.drafter_cotraining.data_preprocessing import (
+            build_input_ids_and_loss_mask,
+        )
+
         self.tokenizer = tokenizer
-        self.max_prompt_len = max_prompt_len
-        self.max_response_len = max_response_len
+        self.max_seq_length = max_seq_length
+        self.chat_template = chat_template
         self.apply_chat_template_kwargs = apply_chat_template_kwargs or {}
         self.pad_token_id = (
             tokenizer.pad_token_id
             if tokenizer.pad_token_id is not None
             else tokenizer.eos_token_id
         )
+        self._build = build_input_ids_and_loss_mask
 
-    def __call__(self, batch_rows: list[tuple[list[dict[str, str]], str]]) -> DataProto:
-        samples: list[tuple[list[int], list[int]]] = []
+    def __call__(
+        self, batch_rows: list[tuple[str, list[dict[str, str]]]]
+    ) -> DataProto:
+        samples: list[tuple[str, torch.Tensor, torch.Tensor]] = []
         skipped = 0
-        for prompt_msgs, response_text in batch_rows:
+        for row_id, conv in batch_rows:
             try:
-                prompt_ids, response_ids = _tokenize_prompt_response(
+                ids, mask = self._build(
                     self.tokenizer,
-                    prompt_msgs,
-                    response_text,
-                    self.max_prompt_len,
-                    self.max_response_len,
+                    conv,
+                    self.chat_template,
+                    self.max_seq_length,
                     self.apply_chat_template_kwargs,
                 )
             except Exception as exc:  # noqa: BLE001
                 skipped += 1
-                logger.warning("Skipping malformed pretrain row: %s", exc)
+                logger.warning("Skipping malformed pretrain row %s: %s", row_id, exc)
                 continue
-            if not prompt_ids or not response_ids:
+            if ids.numel() == 0 or int(mask.sum()) == 0:
                 skipped += 1
                 continue
-            samples.append((prompt_ids, response_ids))
+            samples.append((str(row_id) or str(uuid.uuid4()), ids, mask))
 
         if not samples:
-            raise ValueError(f"All {len(batch_rows)} rows in this batch were invalid")
+            raise ValueError(
+                f"All {len(batch_rows)} rows in this batch were invalid or had "
+                "no assistant tokens to supervise"
+            )
 
-        batch = _pad_batch_to_dataproto(
+        batch = _build_pretrain_dataproto(
             samples=samples,
             pad_token_id=self.pad_token_id,
-            prompt_length=self.max_prompt_len,
-            response_length=self.max_response_len,
+            max_seq_length=self.max_seq_length,
         )
         batch.meta_info["skipped_rows"] = skipped
         return batch
@@ -324,8 +366,8 @@ class DraftModelPretrainTrainer:
             return None
         return ParquetDrafterPretrainDataset(
             data_files,
-            prompt_messages_key=self.config.data.get("prompt_messages_key", "prompt_messages"),
-            response_key=self.config.data.get("response_key", "response"),
+            conversations_key=self.config.data.get("conversations_key", "conversations"),
+            id_key=self.config.data.get("id_key", "id"),
             max_samples=max_samples,
         )
 
@@ -350,8 +392,8 @@ class DraftModelPretrainTrainer:
 
         collator = DrafterPretrainCollator(
             tokenizer=self.tokenizer,
-            max_prompt_len=int(data_cfg.max_prompt_length),
-            max_response_len=int(data_cfg.max_response_length),
+            max_seq_length=int(data_cfg.max_seq_length),
+            chat_template=str(data_cfg.chat_template),
             apply_chat_template_kwargs=data_cfg.get("apply_chat_template_kwargs", {}) or {},
         )
 
@@ -415,14 +457,13 @@ class DraftModelPretrainTrainer:
         self._validate_pretrain_sequence_lengths()
 
     def _validate_pretrain_sequence_lengths(self):
-        max_prompt = int(self.config.data.max_prompt_length)
-        max_response = int(self.config.data.max_response_length)
+        max_seq = int(self.config.data.max_seq_length)
         hs_max_len = int(self.config.hs_collector.inference.max_model_len)
-        if hs_max_len <= max_prompt + max_response:
+        if hs_max_len <= max_seq:
             raise ValueError(
                 "hs_collector.inference.max_model_len must be greater than "
-                "data.max_prompt_length + data.max_response_length because the "
-                "collector sends prompt+response as prefill plus max_tokens=1"
+                "data.max_seq_length — the collector prefills the full "
+                "tokenized conversation plus one max_tokens=1 sample."
             )
 
     def _save_drafter_checkpoint(self, step: int):
@@ -565,8 +606,8 @@ class DraftModelPretrainTrainer:
         print("  Draft model pretraining")
         print(f"  total_training_steps={self.total_training_steps}")
         print(f"  batch_size={self.config.data.train_batch_size}")
-        print(f"  prompt_len={self.config.data.max_prompt_length}")
-        print(f"  response_len={self.config.data.max_response_length}")
+        print(f"  max_seq_length={self.config.data.max_seq_length}")
+        print(f"  chat_template={self.config.data.chat_template}")
         print(f"  logger={self.config.trainer.logger}")
         print("=" * 72)
 

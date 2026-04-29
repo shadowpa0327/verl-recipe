@@ -7,15 +7,16 @@
 #     http://www.apache.org/licenses/LICENSE-2.0
 """Offline drafter-training diagnostic — no rollout.
 
-Feeds pre-recorded prompt+response conversations (ShareGPT-style JSONL, same
-layout TorchSpec ships in `examples/data/sample_conversations.jsonl`) directly
-to the HS collector + drafter trainer. Lets us isolate drafter training
-correctness from rollout nondeterminism.
+Feeds pre-recorded multi-turn conversations (canonical JSONL: one row per
+conversation, ``{"id", "conversations": [{"role", "content"}, ...]}``)
+directly to the HS collector + drafter trainer. Lets us isolate drafter
+training correctness from rollout nondeterminism.
 
 Pipeline per step:
-    conversation batch -> build DataProto(prompts, responses, input_ids,
-    attention_mask, position_ids)
-        -> HS collector (Mooncake prefill)
+    conversation batch -> render with chat template -> tokenize ->
+        per-turn assistant loss_mask (TorchSpec preprocessing semantics)
+        -> DataProto(input_ids, attention_mask, position_ids, loss_mask)
+        -> HS collector (Mooncake prefill, forwards loss_masks unchanged)
         -> DrafterDataController.push + drain
         -> ActorRolloutRefDrafterWorker.update_drafter
            (fetch + collate + Eagle3 forward + 0.8^i backward + optimizer.step)
@@ -66,7 +67,7 @@ from verl.utils.device import auto_set_device
 
 
 def _load_conversations(path: str) -> list[list[dict]]:
-    """Load ShareGPT-style JSONL → list of `conversations` lists.
+    """Load canonical JSONL → list of `conversations` lists.
 
     Each row must have a `conversations` field with a list of
     {"role", "content"} dicts.
@@ -86,139 +87,39 @@ def _load_conversations(path: str) -> list[list[dict]]:
     return out
 
 
-def _split_prompt_response(conv: list[dict]) -> tuple[list[dict], str]:
-    """Take everything up to the final assistant turn as prompt messages,
-    and the final assistant `content` as the response string.
-    """
-    last_assistant_idx = None
-    for i in range(len(conv) - 1, -1, -1):
-        if conv[i].get("role") == "assistant":
-            last_assistant_idx = i
-            break
-    if last_assistant_idx is None:
-        raise ValueError(f"Conversation has no assistant turn: {conv!r}")
-    prompt_msgs = conv[:last_assistant_idx]
-    response_text = conv[last_assistant_idx]["content"]
-    return prompt_msgs, response_text
-
-
-def _tokenize_sample(
-    tokenizer,
-    prompt_msgs: list[dict],
-    response_text: str,
-    max_prompt_len: int,
-    max_response_len: int,
-) -> tuple[list[int], list[int]]:
-    """Apply chat template to `prompt_msgs`, tokenize response separately.
-
-    Returns (prompt_ids, response_ids), both truncated to the configured lengths.
-    The prompt is rendered with `add_generation_prompt=True` so it ends at the
-    assistant header, matching what AgentLoop would produce at rollout time.
-    """
-    prompt_text = tokenizer.apply_chat_template(
-        prompt_msgs,
-        add_generation_prompt=True,
-        tokenize=False,
-    )
-    prompt_ids = tokenizer(prompt_text, add_special_tokens=False)["input_ids"]
-    response_ids = tokenizer(response_text, add_special_tokens=False)["input_ids"]
-
-    # Left-truncate the prompt if it overflows (keep the most recent tokens).
-    if len(prompt_ids) > max_prompt_len:
-        prompt_ids = prompt_ids[-max_prompt_len:]
-    # Right-truncate the response.
-    if len(response_ids) > max_response_len:
-        response_ids = response_ids[:max_response_len]
-    return list(prompt_ids), list(response_ids)
-
-
-def _pad_batch_to_dataproto(
-    samples: list[tuple[list[int], list[int]]],
-    pad_token_id: int,
-    prompt_length: int,
-    response_length: int,
-) -> DataProto:
-    """Pack a list of (prompt_ids, response_ids) pairs into a DataProto with
-    the same layout the rollout path produces (so the HS collector's
-    `_unpad_sequence_ids` accepts it).
-
-    - `prompts`       [B, prompt_length]   left-padded
-    - `responses`     [B, response_length] right-padded
-    - `input_ids`     [B, prompt_length + response_length]  concat
-    - `attention_mask`[B, prompt_length + response_length]  concat
-    - `position_ids`  [B, prompt_length + response_length]  cumsum(mask)-1, clipped at 0
-    """
-    B = len(samples)
-    prompts = torch.full((B, prompt_length), pad_token_id, dtype=torch.long)
-    prompt_mask = torch.zeros((B, prompt_length), dtype=torch.long)
-    responses = torch.full((B, response_length), pad_token_id, dtype=torch.long)
-    response_mask = torch.zeros((B, response_length), dtype=torch.long)
-
-    for i, (p_ids, r_ids) in enumerate(samples):
-        p_len = len(p_ids)
-        r_len = len(r_ids)
-        # Left-pad prompt: valid tokens sit flush to the right edge.
-        if p_len > 0:
-            prompts[i, -p_len:] = torch.tensor(p_ids, dtype=torch.long)
-            prompt_mask[i, -p_len:] = 1
-        # Right-pad response: valid tokens sit flush to the left edge.
-        if r_len > 0:
-            responses[i, :r_len] = torch.tensor(r_ids, dtype=torch.long)
-            response_mask[i, :r_len] = 1
-
-    input_ids = torch.cat([prompts, responses], dim=1)
-    attention_mask = torch.cat([prompt_mask, response_mask], dim=1)
-    # position_ids per attention_mask convention used in verl
-    # (cumsum-1, clamped, zero on pad positions).
-    position_ids = (attention_mask.cumsum(dim=1) - 1).clamp(min=0)
-    position_ids = position_ids * attention_mask
-
-    batch = DataProto.from_single_dict(
-        {
-            "prompts": prompts,
-            "responses": responses,
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "position_ids": position_ids,
-            "response_mask": response_mask,
-        }
-    )
-    batch.non_tensor_batch["uid"] = np.array(
-        [str(uuid.uuid4()) for _ in range(B)], dtype=object
-    )
-    return batch
-
-
 def _iterate_offline_batches(
     conversations: list[list[dict]],
     tokenizer,
     batch_size: int,
-    max_prompt_len: int,
-    max_response_len: int,
+    max_seq_length: int,
+    chat_template: str,
     shuffle_seed: int,
 ) -> Iterator[DataProto]:
-    """Yield infinite DataProto batches from a shuffled copy of `conversations`."""
+    """Yield infinite DataProto batches from a shuffled copy of ``conversations``.
+
+    Uses the same ``DrafterPretrainCollator`` the trainer uses, so the
+    offline diagnostic exercises the per-turn assistant loss-mask path
+    end-to-end.
+    """
+    from recipe.drafter_cotraining.draft_model_pretrain_trainer import (
+        DrafterPretrainCollator,
+    )
+
     rng = np.random.default_rng(shuffle_seed)
     order = np.arange(len(conversations))
-    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+    coll = DrafterPretrainCollator(
+        tokenizer=tokenizer,
+        max_seq_length=max_seq_length,
+        chat_template=chat_template,
+    )
     while True:
         rng.shuffle(order)
-        buf: list[tuple[list[int], list[int]]] = []
+        buf: list[tuple[str, list[dict]]] = []
         for idx in order:
             conv = conversations[int(idx)]
-            try:
-                prompt_msgs, response_text = _split_prompt_response(conv)
-                p_ids, r_ids = _tokenize_sample(
-                    tokenizer, prompt_msgs, response_text, max_prompt_len, max_response_len
-                )
-            except Exception as e:  # noqa: BLE001
-                print(f"  skipping malformed conversation idx={idx}: {e}")
-                continue
-            if not p_ids or not r_ids:
-                continue
-            buf.append((p_ids, r_ids))
+            buf.append((str(uuid.uuid4()), conv))
             if len(buf) == batch_size:
-                yield _pad_batch_to_dataproto(buf, pad_id, max_prompt_len, max_response_len)
+                yield coll(buf)
                 buf = []
         # Discard partial tail; the next epoch reshuffles.
 
@@ -254,13 +155,21 @@ class OfflineDrafterTrainingTrainer(MicroRolloutHSOnlyTrainer):
             "drafter.model_config.local_path must be set — engine is skipped when empty"
         )
 
-        max_prompt_len = int(self.config.data.max_prompt_length)
-        max_response_len = int(self.config.data.max_response_length)
+        max_seq_length = int(
+            self.config.data.get("max_seq_length", 0)
+            or (
+                int(self.config.data.get("max_prompt_length", 0))
+                + int(self.config.data.get("max_response_length", 0))
+            )
+        )
+        if max_seq_length <= 0:
+            raise ValueError("data.max_seq_length must be set to a positive integer")
+        chat_template = str(self.config.data.get("chat_template", "qwen"))
 
         print("=" * 72)
         print(f"  Offline drafter training: max_steps={max_steps} batch_size={batch_size}")
         print(f"  conversations_path={conversations_path}")
-        print(f"  prompt_len={max_prompt_len} response_len={max_response_len}")
+        print(f"  max_seq_length={max_seq_length} chat_template={chat_template}")
         print(f"  drafter.model_config.local_path={model_cfg['local_path']}")
         print(f"  use_hs_collector={self.use_hs_collector}")
         print("=" * 72)
@@ -272,8 +181,8 @@ class OfflineDrafterTrainingTrainer(MicroRolloutHSOnlyTrainer):
             conversations,
             self.tokenizer,
             batch_size=batch_size,
-            max_prompt_len=max_prompt_len,
-            max_response_len=max_response_len,
+            max_seq_length=max_seq_length,
+            chat_template=chat_template,
             shuffle_seed=shuffle_seed,
         )
 
