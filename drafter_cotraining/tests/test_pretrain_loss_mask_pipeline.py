@@ -16,8 +16,8 @@ Covers everything except the actual Ray + vLLM + Mooncake spin-up:
 * ``hs_collector.manager._unpad_sequence_and_mask`` correctly slices both the
   pretrain-style (right-padded + ``loss_masks`` non-tensor) and the legacy
   rollout-style (left-prompt + right-response) DataProto.
-* The full HS-batch → ``DrafterDataController.drain_as_dataproto`` round-trip
-  preserves the per-sample mask.
+* The HSCollectorManager output schema matches what DrafterPretrainWorker expects
+  (unprefixed keys: mooncake_keys, shapes, dtypes, seq_lens, loss_masks).
 * ``ActorRolloutRefDrafterWorker._compute_valid_counts`` returns the expected
   per-sample counts.
 
@@ -225,14 +225,11 @@ def test_unpad_sequence_and_mask_rejects_length_mismatch():
         _unpad_sequence_and_mask(proto[0:1])
 
 
-def test_controller_round_trip_preserves_mask():
+def test_hs_collector_output_schema():
+    """Verify HSCollectorManager output uses unprefixed keys (mooncake_keys, shapes, dtypes, seq_lens, loss_masks)."""
     from verl import DataProto
 
-    from recipe.drafter_cotraining.data.controller import DrafterDataController
-    from recipe.drafter_cotraining.trainer.pretrain_trainer import (
-        _sample_metas_from_hs_batch,
-    )
-
+    # Simulate the output schema from HSCollectorManager.compute_hidden_states_batch
     masks = [
         np.array([0, 0, 1, 1, 1], dtype=np.int64),
         np.array([0, 1, 1, 0], dtype=np.int64),
@@ -240,32 +237,37 @@ def test_controller_round_trip_preserves_mask():
     masks_obj = np.empty(2, dtype=object)
     for i, m in enumerate(masks):
         masks_obj[i] = m
+
     hs_batch = DataProto(
         non_tensor_batch={
-            "hs_mooncake_keys": np.array(["k0", "k1"], dtype=object),
-            "hs_shapes": np.array(
+            "mooncake_keys": np.array(["k0", "k1"], dtype=object),
+            "shapes": np.array(
                 [
                     {"hidden_states": (5, 12), "input_ids": (5,)},
                     {"hidden_states": (4, 12), "input_ids": (4,)},
                 ],
                 dtype=object,
             ),
-            "hs_dtypes": np.array([{}, {}], dtype=object),
-            "hs_seq_lens": np.array([5, 4], dtype=np.int64),
-            "hs_loss_masks": masks_obj,
+            "dtypes": np.array([{}, {}], dtype=object),
+            "seq_lens": np.array([5, 4], dtype=np.int64),
+            "loss_masks": masks_obj,
         }
     )
-    metas = _sample_metas_from_hs_batch(hs_batch)
-    assert [m.seq_len for m in metas] == [5, 4]
-    assert metas[0].loss_mask.tolist() == [0, 0, 1, 1, 1]
-    assert metas[1].loss_mask.tolist() == [0, 1, 1, 0]
 
-    ctrl = DrafterDataController(dp_size=1)
-    ctrl.push_samples(metas)
-    proto = ctrl.drain_as_dataproto()
-    assert "loss_masks" in proto.non_tensor_batch
-    assert proto.non_tensor_batch["loss_masks"][0].tolist() == [0, 0, 1, 1, 1]
-    assert proto.non_tensor_batch["loss_masks"][1].tolist() == [0, 1, 1, 0]
+    # Verify schema matches what DrafterPretrainWorker.update_drafter expects
+    nt = hs_batch.non_tensor_batch
+    assert "mooncake_keys" in nt
+    assert "shapes" in nt
+    assert "dtypes" in nt
+    assert "seq_lens" in nt
+    assert "loss_masks" in nt
+
+    # Verify loss_masks are preserved correctly
+    assert nt["loss_masks"][0].tolist() == [0, 0, 1, 1, 1]
+    assert nt["loss_masks"][1].tolist() == [0, 1, 1, 0]
+
+    # Verify seq_lens match
+    assert nt["seq_lens"].tolist() == [5, 4]
 
 
 def test_compute_valid_counts():

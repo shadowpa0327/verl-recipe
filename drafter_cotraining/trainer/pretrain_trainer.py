@@ -55,60 +55,10 @@ from verl.utils.debug import marked_timer
 from verl.utils.device import is_cuda_available
 from verl.utils.tracking import Tracking
 
-from recipe.drafter_cotraining.data.controller import DrafterDataController, SampleMeta
 from recipe.drafter_cotraining.workers.engine_workers import DrafterPretrainWorker
 
 logger = logging.getLogger(__name__)
 DRAFTER_ROLE = "drafter"
-
-
-def _sample_metas_from_hs_batch(hs_batch: DataProto) -> list[SampleMeta]:
-    """Build SampleMeta list from the HS-collector output DataProto.
-
-    The collector returns per-sample Mooncake key + shape/dtype metadata plus
-    the per-token loss mask the trainer prepared (carried through unchanged
-    so the supervisor positions stay aligned with the prefilled tokens).
-    Both ``hs_mooncake_keys`` and ``hs_loss_masks`` are required.
-    """
-    nt = hs_batch.non_tensor_batch
-    if not nt or "hs_mooncake_keys" not in nt:
-        return []
-    keys = nt["hs_mooncake_keys"]
-    if "hs_loss_masks" not in nt:
-        raise KeyError(
-            "HS-collector output is missing required key 'hs_loss_masks'."
-        )
-    loss_masks = nt["hs_loss_masks"]
-    metas: list[SampleMeta] = []
-    for i in range(len(keys)):
-        seq_len = int(nt["hs_seq_lens"][i])
-        lm = loss_masks[i]
-        if lm is None:
-            raise ValueError(f"hs_loss_masks[{i}] is None for key {keys[i]!r}.")
-        mask_arr = (
-            lm.astype(np.int64).reshape(-1)
-            if isinstance(lm, np.ndarray)
-            else np.asarray(lm, dtype=np.int64).reshape(-1)
-        )
-        # Defensive: clip / pad to seq_len so downstream code can assume the
-        # mask is exactly seq_len long. Length mismatches indicate a producer
-        # bug but shouldn't crash the trainer mid-step.
-        if mask_arr.shape[0] != seq_len:
-            fixed = np.zeros(seq_len, dtype=np.int64)
-            n = min(mask_arr.shape[0], seq_len)
-            fixed[:n] = mask_arr[:n]
-            mask_arr = fixed
-        metas.append(
-            SampleMeta(
-                mooncake_key=str(keys[i]),
-                shapes=nt["hs_shapes"][i] if isinstance(nt["hs_shapes"][i], dict) else {},
-                dtypes=nt["hs_dtypes"][i] if isinstance(nt["hs_dtypes"][i], dict) else {},
-                loss_mask=mask_arr,
-                seq_len=seq_len,
-                n_tokens=seq_len,
-            )
-        )
-    return metas
 
 
 class ParquetDrafterPretrainDataset(Dataset):
@@ -309,8 +259,6 @@ class DraftModelPretrainTrainer:
         self.hs_collector_manager = None
         self.drafter_wg = None
 
-        dp_size = config.trainer.n_gpus_per_node * config.trainer.nnodes
-        self._drafter_ctrl = DrafterDataController(dp_size=dp_size)
         self._create_dataloader(train_dataset=None)
 
     def init_workers(self):
@@ -507,12 +455,10 @@ class DraftModelPretrainTrainer:
 
         with marked_timer("hs_collect", timing_raw, color="cyan"):
             hs_batch = self._compute_hidden_states(batch)
-            sample_metas = _sample_metas_from_hs_batch(hs_batch)
-            self._drafter_ctrl.push_samples(sample_metas)
-            drafter_proto = self._drafter_ctrl.drain_as_dataproto()
 
         prefix = "train" if mode == "train" else "val"
-        if drafter_proto is None:
+        mooncake_keys = hs_batch.non_tensor_batch.get("mooncake_keys")
+        if mooncake_keys is None or len(mooncake_keys) == 0:
             logger.warning("%s step produced no drafter samples", mode)
             return {
                 f"{prefix}/samples": 0.0,
@@ -521,24 +467,25 @@ class DraftModelPretrainTrainer:
                 ),
             }
 
-        drafter_proto.meta_info["mooncake_cfg"] = mooncake_cfg
+        hs_batch.meta_info["mooncake_cfg"] = mooncake_cfg
         timer_name = "drafter_train" if mode == "train" else "drafter_eval"
         with marked_timer("drafter_load", timing_raw, color="yellow"):
             self.drafter_wg.wake_up()
 
         with marked_timer(timer_name, timing_raw, color="magenta"):
             if mode == "train":
-                results = self.drafter_wg.update_drafter(drafter_proto)
+                results = self.drafter_wg.update_drafter(hs_batch)
                 result_key = "train_metrics"
             else:
-                results = self.drafter_wg.evaluate_drafter(drafter_proto)
+                results = self.drafter_wg.evaluate_drafter(hs_batch)
                 result_key = "eval_metrics"
 
         metrics: dict[str, float] = {}
         if results is not None and hasattr(results, "meta_info"):
             metrics.update(results.meta_info.get(result_key, {}) or {})
 
-        metrics[f"{prefix}/samples"] = float(len(sample_metas))
+        n_samples = len(hs_batch.non_tensor_batch.get("mooncake_keys", []))
+        metrics[f"{prefix}/samples"] = float(n_samples)
         metrics[f"{prefix}/skipped_rows"] = float(
             batch.meta_info.get("skipped_rows", 0)
         )

@@ -25,20 +25,23 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RECIPE_ROOT="$(dirname "$SCRIPT_DIR")"
-VERL_ROOT="$(cd "$RECIPE_ROOT/../.." && pwd)"
+VERL_ROOT="$(cd "$RECIPE_ROOT/../../.." && pwd)"
 
 # Dataset/model paths. Override with env vars.
-DATA_DIR="${DATA_DIR:-$HOME/data/qwen3_8b_eagle3_10k}"
+DATA_DIR="${DATA_DIR:-/mnt/hdfs/ccchang_hldy/ultrachat_200k_tenyun_regenerate/canonical_10k}"
 TRAIN_FILE="${TRAIN_FILE:-$DATA_DIR/train.parquet}"
 VAL_FILE="${VAL_FILE:-$DATA_DIR/test.parquet}"
-MODEL_PATH="${MODEL_PATH:-Qwen/Qwen3-8B}"
+MODEL_PATH="${MODEL_PATH:-/mnt/hdfs/ccchang_hldy/Qwen3-8B}"
 PYTHON_BIN="${PYTHON:-python}"
 ATTENTION_BACKEND="${ATTENTION_BACKEND:-flex_attention}"
 
 # Vocab-pruning knobs. Both must be set; the engine sanity-checks shape.
 DRAFT_VOCAB_SIZE="${DRAFT_VOCAB_SIZE:-32000}"
 DRAFT_TEMPLATE="${DRAFT_TEMPLATE:-/tmp/qwen3_8b_draft_${DRAFT_VOCAB_SIZE}.json}"
-VOCAB_MAPPING_PATH="${VOCAB_MAPPING_PATH:-$HOME/cache/vocab_mapping/qwen3_8b_${DRAFT_VOCAB_SIZE}.pt}"
+VOCAB_MAPPING_PATH="${VOCAB_MAPPING_PATH:-/mnt/hdfs/ccchang_hldy/ultrachat_200k_tenyun_regenerate/canonical/qwen3_8b_32k.pt}"
+
+EXPERIMENT_NAME="qwen3_8b_ultrachat200k_canonical10k_all_assistant_turns_dv32000_bs32"
+
 
 if ! "$PYTHON_BIN" -c "import hydra, torch" >/dev/null 2>&1 && [ -x "$VERL_ROOT/.venv/bin/python" ]; then
     PYTHON_BIN="$VERL_ROOT/.venv/bin/python"
@@ -90,14 +93,15 @@ cd "$VERL_ROOT"
     --config-name draft_model_pretrain_trainer \
     data.train_files="['$TRAIN_FILE']" \
     data.eval_files="['$VAL_FILE']" \
-    data.train_batch_size=16 \
-    data.val_batch_size=16 \
+    data.train_batch_size=32 \
+    data.val_batch_size=32 \
     data.max_seq_length=4096 \
     data.chat_template=qwen \
     actor_rollout_ref.model.path="$MODEL_PATH" \
-    actor_rollout_ref.drafter.optimizer_config.lr=2.0e-4 \
+    actor_rollout_ref.drafter.optimizer_config.lr=3e-4 \
     actor_rollout_ref.drafter.optimizer_config.lr_warmup_steps_ratio=0.015 \
-    actor_rollout_ref.drafter.optimizer_config.clip_grad=0.5 \
+    actor_rollout_ref.drafter.optimizer_config.clip_grad=1 \
+    actor_rollout_ref.drafter.engine_config.micro_batch_size_per_gpu=2 \
     actor_rollout_ref.drafter.model_config.attention_backend="$ATTENTION_BACKEND" \
     actor_rollout_ref.drafter.model_config.local_path="$DRAFT_TEMPLATE" \
     actor_rollout_ref.drafter.model_config.vocab_mapping_path="$VOCAB_MAPPING_PATH" \
@@ -105,10 +109,13 @@ cd "$VERL_ROOT"
     hs_collector.inference.gpu_memory_utilization=0.5 \
     pretrain.val_max_batches=-1 \
     trainer.logger='["console"]' \
-    trainer.n_gpus_per_node=4 \
+    trainer.n_gpus_per_node=8 \
     trainer.nnodes=1 \
     trainer.save_freq=-1 \
     trainer.test_freq=-1 \
-    trainer.total_epochs=5 \
+    trainer.total_epochs=15 \
+    trainer.default_local_dir="/mnt/hdfs/ccchang_hldy/ccc_qwen3_8b_eagle3_pretrain/$EXPERIMENT_NAME" \
+    trainer.project_name='ccc_qwen3_8b_eagle3_pretrain' \
+    trainer.experiment_name="$EXPERIMENT_NAME" \
     trainer.val_before_train=false \
     "$@"

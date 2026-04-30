@@ -60,59 +60,11 @@ from verl.utils.debug import marked_timer
 from verl.utils.metric import reduce_metrics
 from verl.utils.rollout_skip import RolloutSkip
 
-from recipe.drafter_cotraining.data.controller import DrafterDataController, SampleMeta
-
-
-def _sample_metas_from_hs_batch(hs_batch: DataProto) -> list[SampleMeta]:
-    """Convert HSCollectorManager.compute_hidden_states output → List[SampleMeta].
-
-    The collector forwards the per-token assistant loss mask the trainer built
-    (length == seq_len) under ``hs_loss_masks``. Both ``hs_mooncake_keys`` and
-    ``hs_loss_masks`` are required.
-    """
-    nt = hs_batch.non_tensor_batch
-    if not nt or "hs_mooncake_keys" not in nt:
-        return []
-    keys = nt["hs_mooncake_keys"]
-    if "hs_loss_masks" not in nt:
-        raise KeyError(
-            "HS-collector output is missing required key 'hs_loss_masks'."
-        )
-    loss_masks = nt["hs_loss_masks"]
-    metas: list[SampleMeta] = []
-    for i in range(len(keys)):
-        seq_len = int(nt["hs_seq_lens"][i])
-        lm = loss_masks[i]
-        if lm is None:
-            raise ValueError(f"hs_loss_masks[{i}] is None for key {keys[i]!r}.")
-        mask = (
-            lm.astype(np.int64).reshape(-1)
-            if isinstance(lm, np.ndarray)
-            else np.asarray(lm, dtype=np.int64).reshape(-1)
-        )
-        if mask.shape[0] != seq_len:
-            fixed = np.zeros(seq_len, dtype=np.int64)
-            n = min(mask.shape[0], seq_len)
-            fixed[:n] = mask[:n]
-            mask = fixed
-        metas.append(
-            SampleMeta(
-                mooncake_key=str(keys[i]),
-                shapes=nt["hs_shapes"][i] if isinstance(nt["hs_shapes"][i], dict) else {},
-                dtypes=nt["hs_dtypes"][i] if isinstance(nt["hs_dtypes"][i], dict) else {},
-                loss_mask=mask,
-                seq_len=seq_len,
-                n_tokens=seq_len,
-            )
-        )
-    return metas
-
 
 class RayDrafterCTPPOTrainer(RayPPOTrainer):
     """RayPPOTrainer with EAGLE drafter co-training sub-pipeline.
 
     Adds:
-    - DrafterDataController on driver (owns Levels 1 & 2)
     - Drafter sub-pipeline in fit() after rollout, before reward
     """
 
@@ -125,9 +77,6 @@ class RayDrafterCTPPOTrainer(RayPPOTrainer):
             **kwargs,
         )
 
-        # Initialize drafter data controller on driver
-        dp_size = config.trainer.n_gpus_per_node * config.trainer.nnodes
-        self._drafter_ctrl = DrafterDataController(dp_size=dp_size)
         self.use_hs_collector = bool(config.get("hs_collector", {}).get("enabled", False))
         self.hs_collector_manager = None
 
@@ -194,23 +143,21 @@ class RayDrafterCTPPOTrainer(RayPPOTrainer):
         return self.hs_collector_manager.compute_hidden_states(batch)
 
     def _run_drafter_sub_pipeline(self, batch: DataProto, timing_raw: dict, metrics: dict):
-        """HS collection (colocated) → sample pool → mesh dispatch → drafter training."""
+        """HS collection (colocated) → mesh dispatch → drafter training."""
         if not self._should_compute_hidden_states_colocate(batch):
             return
 
         with marked_timer("drafter", timing_raw, color="cyan"):
             hs_batch = self._compute_hidden_states_colocate(batch)
-            sample_metas = _sample_metas_from_hs_batch(hs_batch)
-            self._drafter_ctrl.push_samples(sample_metas)
-
-            drafter_proto = self._drafter_ctrl.drain_as_dataproto()
-            if drafter_proto is not None:
+            mooncake_keys = hs_batch.non_tensor_batch.get("mooncake_keys")
+            if mooncake_keys is not None and len(mooncake_keys) > 0:
                 # Pass mooncake connection info so each drafter rank can build a reader.
-                drafter_proto.meta_info["mooncake_cfg"] = OmegaConf.to_container(
+                hs_batch.meta_info["mooncake_cfg"] = OmegaConf.to_container(
                     self.config.mooncake, resolve=True
                 )
-                self.actor_rollout_wg.update_drafter(drafter_proto)
-                metrics["drafter/samples_trained"] = len(sample_metas)
+                self.actor_rollout_wg.update_drafter(hs_batch)
+                n_samples = len(mooncake_keys)
+                metrics["drafter/samples_trained"] = n_samples
 
     def fit(self):
         """

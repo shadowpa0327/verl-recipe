@@ -9,7 +9,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RECIPE_ROOT="$(dirname "$SCRIPT_DIR")"
-VERL_ROOT="$(cd "$RECIPE_ROOT/../.." && pwd)"
+VERL_ROOT="$(cd "$RECIPE_ROOT/../../.." && pwd)"
 
 # Dataset/model paths. Override with env vars.
 DATA_DIR="${DATA_DIR:-$HOME/data/qwen3_8b_eagle3_10k}"

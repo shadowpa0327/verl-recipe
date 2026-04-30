@@ -7,7 +7,7 @@ Adds:
 HS collection is owned by HSCollectorManager on the trainer driver
 (see verl/experimental/hs_collector/), not by this worker.
 
-The DrafterDataController also lives on the driver. This worker only:
+This worker:
 - Receives per-rank data via mesh dispatch (update_drafter)
 - Fetches tensors from Mooncake
 - Runs drafter training

@@ -83,14 +83,14 @@ class AsyncHSCollectorServerManager(AsyncLLMServerManager):
 
         return DataProto(
             non_tensor_batch={
-                "hs_mooncake_keys": np.array([r["mooncake_key"] for r in results], dtype=object),
-                "hs_shapes": np.array([r["shapes"] for r in results], dtype=object),
-                "hs_dtypes": np.array([r["dtypes"] for r in results], dtype=object),
-                "hs_seq_lens": np.array([r["seq_len"] for r in results], dtype=np.int64),
+                "mooncake_keys": np.array([r["mooncake_key"] for r in results], dtype=object),
+                "shapes": np.array([r["shapes"] for r in results], dtype=object),
+                "dtypes": np.array([r["dtypes"] for r in results], dtype=object),
+                "seq_lens": np.array([r["seq_len"] for r in results], dtype=np.int64),
                 # Per-token assistant supervision mask, length = seq_len.
                 # Carried through as object-dtype because seq_len varies across
                 # samples (no rectangular tensor possible without padding).
-                "hs_loss_masks": loss_masks_obj,
+                "loss_masks": loss_masks_obj,
             },
         )
 
