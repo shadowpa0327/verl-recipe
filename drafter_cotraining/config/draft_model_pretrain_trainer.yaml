@@ -385,5 +385,18 @@ trainer:
   # Do not run PPO validation.
   val_before_train: False
 
+  # Resume mode: "disable" starts from scratch; "auto" resumes from the
+  # latest checkpoint if one exists (otherwise starts from scratch);
+  # "resume_path" resumes from a user-specified directory (requires
+  # resume_from_path).
+  resume_mode: auto
+
+  # Checkpoint directory to resume from. Only used when resume_mode is
+  # "resume_path". Must contain "global_step_" in the path.
+  resume_from_path: null
+
+  # Delete local checkpoint files after loading them on resume.
+  del_local_ckpt_after_load: False
+
   # Use the new worker implementation required by ActorRolloutRefDrafterWorker.
   use_legacy_worker_impl: disable

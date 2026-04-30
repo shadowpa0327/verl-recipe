@@ -801,6 +801,18 @@ class ActorRolloutRefDrafterWorker(ActorRolloutRefWorker):
             return
         self.drafter.save_checkpoint(local_path, hdfs_path, global_step, max_ckpt_to_keep)
 
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def load_drafter_checkpoint(self, local_path, hdfs_path=None, del_local_after_load=False):
+        """Load drafter-engine checkpoint.
+
+        ``self.drafter`` is a TrainingWorker whose ``load_checkpoint`` forwards
+        to ``FSDPDrafterEngine.load_checkpoint``, which restores sharded FSDP
+        state + optimizer state.
+        """
+        if self.drafter is None:
+            return
+        self.drafter.load_checkpoint(local_path, hdfs_path, del_local_after_load)
+
     # ── Weight Sync ───────────────────────────────────────────
 
     # TODO(co-training): Restore _load_rollout_drafter_snapshot and
@@ -884,6 +896,7 @@ class DrafterPretrainWorker(Worker):
     _aggregate_drafter_metrics = ActorRolloutRefDrafterWorker._aggregate_drafter_metrics
     _get_mooncake_store = ActorRolloutRefDrafterWorker._get_mooncake_store
     save_drafter_checkpoint = ActorRolloutRefDrafterWorker.save_drafter_checkpoint
+    load_drafter_checkpoint = ActorRolloutRefDrafterWorker.load_drafter_checkpoint
 
     def __init__(self, config: DictConfig, role: str = "drafter", **kwargs):
         del role, kwargs

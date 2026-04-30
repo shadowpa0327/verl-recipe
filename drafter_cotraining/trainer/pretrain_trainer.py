@@ -53,6 +53,7 @@ from verl.single_controller.ray import RayWorkerGroup, ResourcePoolManager
 from verl.trainer.constants_ppo import get_ppo_ray_runtime_env
 from verl.utils.debug import marked_timer
 from verl.utils.device import is_cuda_available
+from verl.utils.fs import local_mkdir_safe
 from verl.utils.tracking import Tracking
 
 from recipe.drafter_cotraining.workers.engine_workers import DrafterPretrainWorker
@@ -414,6 +415,8 @@ class DraftModelPretrainTrainer:
             )
 
     def _save_drafter_checkpoint(self, step: int):
+        from verl.utils.checkpoint.checkpoint_manager import get_checkpoint_tracker_filename
+
         local_global_step_folder = os.path.join(
             self.config.trainer.default_local_dir,
             f"global_step_{step}",
@@ -438,6 +441,86 @@ class DraftModelPretrainTrainer:
             step,
             max_ckpt_to_keep=max_to_keep,
         )
+
+        # Save dataloader state
+        dataloader_local_path = os.path.join(local_global_step_folder, "data.pt")
+        dataloader_state_dict = self.train_dataloader.state_dict()
+        torch.save(dataloader_state_dict, dataloader_local_path)
+
+        # Write tracker file so find_latest_ckpt_path can discover this checkpoint
+        local_mkdir_safe(self.config.trainer.default_local_dir)
+        tracker_filename = get_checkpoint_tracker_filename(self.config.trainer.default_local_dir)
+        with open(tracker_filename, "wb") as f:
+            f.write(str(step).encode())
+
+    def _load_checkpoint(self) -> int:
+        """Load drafter checkpoint + dataloader state.
+
+        Follows the same resume_mode contract as RayPPOTrainer:
+        - "disable": always start from scratch (returns 0)
+        - "auto": resume from latest checkpoint if found
+        - "resume_path": resume from a user-specified path
+
+        Returns the restored global_steps (0 if starting from scratch).
+        """
+        from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
+
+        resume_mode = self.config.trainer.get("resume_mode", "disable")
+        if resume_mode == "disable":
+            return 0
+
+        if self.config.trainer.default_hdfs_dir is not None:
+            raise NotImplementedError("Resume from HDFS is not implemented yet")
+
+        checkpoint_folder = self.config.trainer.default_local_dir
+        if not os.path.isabs(checkpoint_folder):
+            checkpoint_folder = os.path.join(os.getcwd(), checkpoint_folder)
+
+        global_step_folder = find_latest_ckpt_path(checkpoint_folder)
+
+        if resume_mode == "auto":
+            if global_step_folder is None:
+                print("No checkpoint found, training from scratch")
+                return 0
+        elif resume_mode == "resume_path":
+            resume_from_path = self.config.trainer.get("resume_from_path", None)
+            assert isinstance(resume_from_path, str), "resume_from_path must be a string"
+            assert "global_step_" in resume_from_path, "resume_from_path must contain 'global_step_'"
+            global_step_folder = resume_from_path
+            if not os.path.isabs(global_step_folder):
+                global_step_folder = os.path.join(os.getcwd(), global_step_folder)
+        else:
+            raise ValueError(f"Unknown resume_mode: {resume_mode}")
+
+        # Parse global step from folder name
+        global_steps = int(global_step_folder.split("global_step_")[-1])
+        print(f"Resuming from checkpoint: {global_step_folder} (global_steps={global_steps})")
+
+        # Load drafter weights + optimizer
+        drafter_path = os.path.join(global_step_folder, "drafter")
+        del_local = bool(self.config.trainer.get("del_local_ckpt_after_load", False))
+        self.drafter_wg.load_drafter_checkpoint(
+            drafter_path, del_local_after_load=del_local
+        )
+
+        # Restore dataloader state
+        dataloader_local_path = os.path.join(global_step_folder, "data.pt")
+        if os.path.exists(dataloader_local_path):
+            steps_per_epoch = len(self.train_dataloader)
+            at_epoch_boundary = steps_per_epoch > 0 and global_steps % steps_per_epoch == 0
+            if at_epoch_boundary:
+                print(
+                    f"Skipping dataloader state restore: global_steps={global_steps} "
+                    f"is at an epoch boundary (steps_per_epoch={steps_per_epoch}). "
+                    f"Next epoch will iterate from scratch."
+                )
+            else:
+                dataloader_state_dict = torch.load(dataloader_local_path, weights_only=False)
+                self.train_dataloader.load_state_dict(dataloader_state_dict)
+        else:
+            print(f"Warning: No dataloader state found at {dataloader_local_path}, starting from scratch")
+
+        return global_steps
 
     def _compute_hidden_states(self, batch: DataProto) -> DataProto:
         assert self.hs_collector_manager is not None, "HSCollectorManager is not initialized"
@@ -557,13 +640,16 @@ class DraftModelPretrainTrainer:
         print(f"  logger={self.config.trainer.logger}")
         print("=" * 72)
 
-        self.global_steps = 0
+        self.global_steps = self._load_checkpoint()
         if self.config.trainer.get("val_before_train", False):
             self._validate(tracker=tracker, mooncake_cfg=mooncake_cfg, step=self.global_steps)
 
         progress_bar = tqdm(total=self.total_training_steps, desc="Draft Pretrain")
+        if self.global_steps > 0:
+            progress_bar.update(self.global_steps)
 
-        epoch = 0
+        steps_per_epoch = len(self.train_dataloader)
+        epoch = self.global_steps // steps_per_epoch if steps_per_epoch > 0 else 0
         total_epochs = int(self.config.trainer.total_epochs)
         explicit_total_steps = self.config.trainer.total_training_steps is not None
         test_freq = int(self.config.trainer.test_freq)

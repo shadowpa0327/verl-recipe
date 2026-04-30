@@ -111,13 +111,13 @@ cd "$VERL_ROOT"
     hs_collector.inference.max_model_len=6176 \
     hs_collector.inference.gpu_memory_utilization=0.5 \
     pretrain.val_max_batches=-1 \
-    trainer.logger='["console", "wandb"]' \
+    trainer.logger='["console"]' \
     trainer.n_gpus_per_node=8 \
     trainer.nnodes=1 \
     trainer.save_freq=-1 \
     trainer.test_freq=-1 \
     trainer.total_epochs=10 \
-    trainer.default_local_dir="/mnt/hdfs/ccchang_hldy/ccc_qwen3_8b_eagle3_pretrain/$EXPERIMENT_NAME" \
+    trainer.default_local_dir="./ccc_qwen3_8b_eagle3_pretrain/$EXPERIMENT_NAME" \
     trainer.project_name='ccc_qwen3_8b_eagle3_pretrain' \
     trainer.experiment_name="$EXPERIMENT_NAME" \
     trainer.val_before_train=false \
