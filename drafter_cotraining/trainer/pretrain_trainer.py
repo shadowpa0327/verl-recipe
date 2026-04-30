@@ -22,7 +22,7 @@ Each parquet row is a full multi-turn conversation in canonical form:
         -> Mooncake sample metadata + per-sample loss_mask
         -> DrafterPretrainWorker.update_drafter
 
-Loss mask semantics (ported from TorchSpec ``preprocess_conversations``):
+Loss mask semantics:
 every assistant content token is supervised (loss_mask=1); user/system/tool
 tokens are 0. Truncation past ``data.max_seq_length`` is implicit — partial
 assistant turns contribute their surviving prefix.
