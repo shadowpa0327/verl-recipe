@@ -459,7 +459,8 @@ class RayDrafterCTPPOTrainer(RayPPOTrainer):
                             self.checkpoint_manager.update_weights(self.global_steps)
                             if self.hs_collector_manager is not None:
                                 # HS collector mirrors the actor; re-sync after actor update.
-                                # (update_weights is a TODO stub — see HSCollectorManager.)
+                                # TODO(co-training): update_weights raises NotImplementedError
+                                # until wired to verl's checkpoint_engine. Not needed for pretrain.
                                 self.hs_collector_manager.update_weights(params=None)
 
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])

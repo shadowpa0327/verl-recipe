@@ -152,7 +152,7 @@ class ActorRolloutRefDrafterWorker(ActorRolloutRefWorker):
         logger.info("Drafter TrainingWorker initialized")
 
     def _sync_drafter_frozen_modules(self):
-        """Copy frozen weights from actor into drafter.
+        """Copy frozen weights from actor into drafter (co-training only).
 
         Syncs: embed_tokens, target_lm_head_weight, verifier_norm (final RMSNorm).
         All frozen (requires_grad=False). embed_tokens for drafter input,
@@ -162,6 +162,10 @@ class ActorRolloutRefDrafterWorker(ActorRolloutRefWorker):
         Called at init and after each update_actor(). In verl the actor trains
         every RL step (unlike TorchSpec where the target is fixed), so the
         drafter's frozen copies must stay synchronized.
+
+        TODO(co-training): Implement FSDP-aware gathering of actor params.
+        Currently only works when actor/drafter are on the same FSDP unit.
+        Pretrain worker overrides this with a no-op (frozen weights from disk).
         """
         if self.actor is None or self.drafter is None:
             return
@@ -799,79 +803,26 @@ class ActorRolloutRefDrafterWorker(ActorRolloutRefWorker):
 
     # ── Weight Sync ───────────────────────────────────────────
 
-    def _load_rollout_drafter_snapshot(self, report: dict):
-        if "weights_path" in report:
-            return torch.load(report["weights_path"], map_location="cpu", weights_only=True)
-        return report["weights"]
-
-    def _iter_rollout_drafter_snapshot(self, randomize: bool, seed: int):
-        snapshot = getattr(self, "_rollout_drafter_weight_sync_snapshot", None)
-        if snapshot is None:
-            raise RuntimeError("No rollout drafter snapshot cached on this rank.")
-
-        generator = None
-        if randomize:
-            import torch.distributed as dist
-
-            rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
-            generator = torch.Generator(device="cpu")
-            generator.manual_seed(seed + rank)
-
-        items = snapshot.items() if isinstance(snapshot, dict) else snapshot
-        for item in items:
-            if not isinstance(item, (tuple, list)) or len(item) != 2:
-                raise TypeError(f"Expected snapshot item to be a (name, tensor) pair, got {type(item).__name__}: {item!r}")
-            name, tensor = item
-            if not isinstance(name, str):
-                raise TypeError(f"Expected snapshot tensor name to be str, got {type(name).__name__}: {name!r}")
-            if not isinstance(tensor, torch.Tensor):
-                if isinstance(tensor, (str, bytes, dict)):
-                    raise TypeError(
-                        f"Expected snapshot value for {name!r} to be tensor-like, got {type(tensor).__name__}"
-                    )
-                tensor = torch.as_tensor(tensor)
-            if randomize and tensor.is_floating_point():
-                randomized = torch.empty_like(tensor)
-                randomized.normal_(generator=generator)
-                yield name, randomized
-            else:
-                yield name, tensor
+    # TODO(co-training): Restore _load_rollout_drafter_snapshot and
+    # _iter_rollout_drafter_snapshot when re-enabling the rollout weight
+    # sync test (requires vllm_rollout drafter APIs). Removed for
+    # pretrain-only scope.
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
     async def update_rollout_drafter_weights_from_snapshot(self, mode: str = "restore", seed: int = 2026):
         """TEST_ONLY: push random/restored drafter weights through verl IPC.
 
-        Self-caching: first call fetches the baseline drafter state_dict from
-        vLLM workers via ``self.rollout.get_drafter_weights()`` and stashes it
-        on this rank. Subsequent calls reuse the cache. Pushes through
-        ``ServerAdapter.update_drafter_weights`` → server-side shared-name
-        filter → ``drafter.model.load_weights``.
+        TODO(co-training): Requires rollout.get_drafter_weights() and
+        rollout.update_drafter_weights() APIs in vllm_rollout, which were
+        reverted for the pretrain-only scope. Re-enable when co-training
+        is activated.
         """
-        if self.rollout is None:
-            return {"ok": False, "reason": "rollout is not initialized"}
-        if mode not in {"random", "restore"}:
-            raise ValueError(f"mode must be 'random' or 'restore', got {mode!r}")
-
-        # Lazy one-shot cache of baseline drafter weights (CPU side).
-        if getattr(self, "_rollout_drafter_weight_sync_snapshot", None) is None:
-            reports = await self.rollout.get_drafter_weights()
-            if isinstance(reports, list):
-                rollout_rank = getattr(self.rollout, "rollout_rank", 0)
-                report = reports[rollout_rank] if rollout_rank < len(reports) else None
-            else:
-                report = reports
-            if not report or not report.get("ok", False):
-                reason = report.get("reason") if report else "missing snapshot report"
-                return {"ok": False, "reason": reason}
-            self._rollout_drafter_weight_sync_snapshot = self._load_rollout_drafter_snapshot(report)
-
-        weights = self._iter_rollout_drafter_snapshot(randomize=(mode == "random"), seed=seed)
-        await self.rollout.update_drafter_weights(weights)
-        return {
-            "ok": True,
-            "mode": mode,
-            "num_tensors": len(self._rollout_drafter_weight_sync_snapshot),
-        }
+        raise NotImplementedError(
+            "update_rollout_drafter_weights_from_snapshot requires "
+            "rollout.get_drafter_weights / rollout.update_drafter_weights "
+            "APIs (reverted for pretrain-only scope). "
+            "See TODO(co-training) in weight-sync-flows.md Flow 4."
+        )
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
     async def update_weights(self, global_steps: int = None):
@@ -884,6 +835,10 @@ class ActorRolloutRefDrafterWorker(ActorRolloutRefWorker):
 
         Note: actor → HS collector sync is driven from the trainer via
         HSCollectorManager.update_weights, not here.
+
+        TODO(co-training): Step 2 (drafter → rollout) requires the
+        update_drafter_weights API in verl/workers/rollout/vllm_rollout/,
+        which was reverted for the pretrain-only scope.
         """
         # Actor → rollout (inherited)
         await super().update_weights(global_steps=global_steps)
@@ -893,9 +848,14 @@ class ActorRolloutRefDrafterWorker(ActorRolloutRefWorker):
             self._sync_drafter_frozen_modules()
 
         if self.drafter is not None and self.rollout is not None:
-            # Drafter → rollout (for speculative decoding at inference time)
-            drafter_params, _ = self.drafter.engine.get_per_tensor_param()
-            await self.rollout.update_drafter_weights(drafter_params)
+            # TODO(co-training): Drafter → rollout weight sync (Flow 4).
+            # Requires update_drafter_weights API in vllm_rollout (reverted
+            # for pretrain-only scope). Re-enable when co-training is activated.
+            raise NotImplementedError(
+                "Drafter → rollout weight sync is not yet implemented. "
+                "Required for co-training only (speculative decoding at inference time). "
+                "See TODO(co-training) in weight-sync-flows.md Flow 4."
+            )
 
 
 class DrafterPretrainWorker(Worker):
@@ -938,7 +898,8 @@ class DrafterPretrainWorker(Worker):
         self._mooncake_store = None
 
     def _sync_drafter_frozen_modules(self):
-        return
+        """No-op for pretrain: frozen weights come from target_model_path on disk."""
+
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):

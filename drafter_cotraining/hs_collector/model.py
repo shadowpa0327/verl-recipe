@@ -159,11 +159,17 @@ class HSCollectorManager:
     def update_weights(self, params) -> None:
         """Push fresh actor weights to all HS-collector replicas (they mirror the actor).
 
-        TODO: wire to verl's checkpoint_engine (same path used for actor → rollout).
+        TODO(co-training): Wire to verl's checkpoint_engine (same path used for actor → rollout).
         Teacher doesn't need this because its model is frozen; our HS collector mirrors
         the live actor and must re-sync after each update_actor().
+
+        Not needed for pretrain (target model is frozen throughout).
         """
-        pass
+        raise NotImplementedError(
+            "HSCollectorManager.update_weights is not yet implemented. "
+            "Required for co-training only (HS collector must re-sync after actor update). "
+            "See TODO(co-training) in weight-sync-flows.md Flow 2."
+        )
 
     @auto_await
     async def wake_up(self):
