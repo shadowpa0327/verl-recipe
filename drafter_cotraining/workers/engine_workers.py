@@ -98,7 +98,7 @@ class ActorRolloutRefDrafterWorker(ActorRolloutRefWorker):
         from verl.workers.config import FSDPEngineConfig, FSDPOptimizerConfig
         from verl.workers.engine_workers import TrainingWorker, TrainingWorkerConfig
 
-        from recipe.drafter_cotraining.engine.drafter_engine import (
+        from recipe.drafter_cotraining.workers.drafter_engine import (
             DrafterModelConfig,
             build_drafter_subconfig,
         )

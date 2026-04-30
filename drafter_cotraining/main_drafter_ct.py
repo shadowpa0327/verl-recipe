@@ -39,7 +39,7 @@ class DrafterCTTaskRunner(TaskRunner):
         """Override to swap in ActorRolloutRefDrafterWorker."""
         from verl.single_controller.ray import RayWorkerGroup
         from verl.trainer.ppo.ray_trainer import Role
-        from recipe.drafter_cotraining.engine.workers import ActorRolloutRefDrafterWorker
+        from recipe.drafter_cotraining.workers.engine_workers import ActorRolloutRefDrafterWorker
 
         actor_rollout_cls = ActorRolloutRefDrafterWorker
         ray_worker_group_cls = RayWorkerGroup

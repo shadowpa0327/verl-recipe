@@ -271,7 +271,7 @@ def test_controller_round_trip_preserves_mask():
 def test_compute_valid_counts():
     from verl import DataProto
 
-    from recipe.drafter_cotraining.engine.workers import ActorRolloutRefDrafterWorker
+    from recipe.drafter_cotraining.workers.engine_workers import ActorRolloutRefDrafterWorker
 
     masks_obj = np.empty(3, dtype=object)
     masks_obj[0] = np.array([0, 0, 1, 1, 1], dtype=np.int64)
