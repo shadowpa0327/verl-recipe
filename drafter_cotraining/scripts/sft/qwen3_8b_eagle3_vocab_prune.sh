@@ -21,8 +21,6 @@
 #   ~/data/qwen3_8b_eagle3_10k/{train,test}.parquet
 #   $DRAFT_TEMPLATE   (defaults to a /tmp file written below)
 #   $VOCAB_MAPPING_PATH
-#
-# See claude_docs/vocab-pruning.md for the full guide.
 
 set -euo pipefail
 

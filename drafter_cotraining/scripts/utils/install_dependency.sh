@@ -5,7 +5,7 @@
 #
 # Aligned with vllm018 Docker image:
 #   - Python 3.12, CUDA 12.9, PyTorch 2.10, vLLM 0.18.0
-#   - Supports TorchSpec KV connector (MooncakeHiddenStatesConnector)
+#   - Includes the Mooncake KV connector (MooncakeHiddenStatesConnector)
 
 set -e  # Exit on error
 

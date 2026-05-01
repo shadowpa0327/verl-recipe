@@ -4,7 +4,7 @@
 # drafter-pretrain parquet layout (id + conversations + extra_info).
 #
 # Example:
-#     INPUT=/root/TorchSpec/examples/data/ultrachat_qwen3_8b_eagle3_10k.jsonl \
+#     INPUT=/path/to/canonical.jsonl \
 #     DATA_DIR=$HOME/data/qwen3_8b_eagle3_10k \
 #     bash recipe/drafter_cotraining/scripts/data_preprocess/prepare_canonical_jsonl_data.sh
 set -uxo pipefail
