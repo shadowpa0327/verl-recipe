@@ -13,7 +13,7 @@ Relationship to Eagle3Model:
     FSDPEngine holding LlamaForCausalLM for the actor.
 
     FSDPDrafterEngine (verl)
-      └── self.module = Eagle3Model (from torchspec, pure PyTorch)
+      └── self.module = Eagle3Model (pure PyTorch)
             └── self.draft_model = LlamaForCausalLMEagle3
                   ├── embed_tokens  (frozen, copied from actor)
                   ├── fc            (trainable)
@@ -27,9 +27,9 @@ Frozen modules (embed_tokens, verifier_norm, target_lm_head_weight):
     every RL step. Call sync_frozen_modules_from_actor() at init and
     after each actor update.
 
-    Note: lm_head is NOT frozen. Per TorchSpec, the draft model has its
-    own trainable lm_head (for draft logits in the loss kernel), separate
-    from target_lm_head_weight (frozen, for target distribution).
+    Note: lm_head is NOT frozen. The draft model has its own trainable
+    lm_head (for draft logits in the loss kernel), separate from
+    target_lm_head_weight (frozen, for target distribution).
 
 Usage:
     engine = EngineRegistry.new("drafter_model", "fsdp2", "cuda", ...)
@@ -76,8 +76,7 @@ class DrafterModelConfig(BaseConfig):
     # tensor at the cost of a per-TTT-step ``(N_valid, V_full)`` softmax.
     # The lazy path defends against autograd-graph leakage with a triple
     # ``.detach()`` (factory + kernel) so it stays safe under FSDP2
-    # micro-batch accumulation. See ``LazyTarget vs Precomputed Memory
-    # Analysis.md`` for the memory crossover.
+    # micro-batch accumulation.
     enable_lazy_target: bool = False
 
     # Path to the target (verifier) model — a HF repo id or local dir. We load
@@ -85,7 +84,6 @@ class DrafterModelConfig(BaseConfig):
     #   embed_tokens.weight      → draft_model.embed_tokens  (FSDP2-broadcast via fsdp2_load_full_state_dict)
     #   lm_head.weight           → self._target_lm_head_weight (dist.broadcast from rank 0)
     #   model.norm.weight        → self._verifier_norm.weight  (dist.broadcast from rank 0)
-    # Matches TorchSpec's eagle3_trainer load pattern.
     target_model_path: Optional[str] = None
 
     # Optional draft-vocab pruning mapping — path to a .pt file with
@@ -265,7 +263,6 @@ class FSDPDrafterEngine(FSDPEngine):
             logger.info("[rank %d] Loaded pretrained drafter from %s", rank, model_path)
         else:
             # Auto-derive draft architecture from the target's HF AutoConfig.
-            # local_path is an optional template overlay — see auto.py.
             draft_config = AutoDraftModelConfig.from_target(target_path, template_path=local_path)
             draft_model = AutoEagle3DraftModel.from_config(
                 draft_config,
@@ -352,11 +349,11 @@ class FSDPDrafterEngine(FSDPEngine):
             replicate_dtensor)` correctly by promoting the plain input to a
             Replicate DTensor → DTensor × DTensor matmul.
 
-        See `verl/utils/fsdp_utils.py:734-766` (`set_reshard_after_forward`
-        docstring) for the auto-root-detection guarantee, and
-        `claude_docs/research/Eagle3-Co-Trained/FSDP2 Wrap — TorchSpec
-        Cross-Reference.md` for the full design rationale and a comparison
-        against TorchSpec's per-Linear granularity.
+        See `verl/utils/fsdp_utils.py` (`set_reshard_after_forward` docstring)
+        for the auto-root-detection guarantee. The choice of LlamaDecoderLayer
+        as the only sub-unit (rather than wrapping each Linear separately) is
+        what keeps `lm_head` in the root unit and makes the kernel's
+        extracted-tensor read see a gathered (Replicate) DTensor.
 
         FSDP2-only — FSDP1 is intentionally not supported on this engine. The
         @EngineRegistry.register backend list is `["fsdp2"]`, so an FSDP1
@@ -400,7 +397,7 @@ class FSDPDrafterEngine(FSDPEngine):
         # from rank 0 onto every rank's sharded DTensors after wrap.
         full_state = module.state_dict()
 
-        # Shard only LlamaDecoderLayer sub-units (TorchSpec-style).
+        # Shard only LlamaDecoderLayer sub-units.
         # Sub-units default to reshard_after_forward=True.
         sharded_count = 0
         for _name, sub in module.named_modules():
@@ -680,8 +677,7 @@ class FSDPDrafterEngine(FSDPEngine):
         # aux[t] + token[t+1] (the token the verifier just emitted) and predict
         # token[t+2] = softmax(lm_head · verifier_hs[t+1]). Our Mooncake producer
         # captures at positions 0..T-1 (input_ids[t]=token[t], last_hs[t]=HS[t]),
-        # so the training loop needs this shift — matches TorchSpec
-        # `eagle3_trainer.py::_forward` (padding(..., left=False)).
+        # so the training loop needs this shift.
         input_ids = padding(input_ids, left=False)
         last_hidden_states = padding(last_hidden_states, left=False)
 

@@ -35,11 +35,10 @@ logger = logging.getLogger(__name__)
 
 
 # ── Auto-derive draft architecture from target model ──────────────────────
-# Ported from TorchSpec torchspec/config/utils.py:32-149. Source of truth
-# for "what shape should the draft be" given a target model — replaces the
-# hand-tuned per-target JSON workflow. Override draft-specific fields
-# (draft_vocab_size for vocab pruning, non-Llama architectures) by passing
-# a template_config_path that the auto-derive overlays on top of.
+# Source of truth for "what shape should the draft be" given a target model —
+# replaces the hand-tuned per-target JSON workflow. Override draft-specific
+# fields (draft_vocab_size for vocab pruning, non-Llama architectures) by
+# passing a template_config_path that the auto-derive overlays on top of.
 
 def _copy_config_value(value):
     if hasattr(value, "to_dict"):

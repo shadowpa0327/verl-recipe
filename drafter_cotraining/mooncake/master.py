@@ -32,8 +32,6 @@ from urllib.parse import urlparse
 
 import ray
 
-# RayActor replaced with ray.remote
-# env var passthrough removed (torchspec-specific)
 import logging
 logger = logging.getLogger(__name__)
 

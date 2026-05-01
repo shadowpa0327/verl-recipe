@@ -284,13 +284,13 @@ actor_rollout_ref:
       # to slice target logits and build a position_mask. Requires the draft
       # architecture to declare ``draft_vocab_size`` < ``vocab_size`` — supply
       # via a template JSON at ``local_path`` above. When null, training runs
-      # on the full target vocab. See claude_docs/vocab-pruning.md.
+      # on the full target vocab.
       vocab_mapping_path: null
 
     # Drafter FSDP engine config.
     engine_config:
 
-      # FSDP2 with selective wrap (TorchSpec-style): only LlamaDecoderLayer
+      # FSDP2 with selective wrap: only LlamaDecoderLayer
       # gets its own FSDP unit; lm_head/norm/fc/embed_tokens stay in the root
       # unit so they remain gathered through backward (auto-root-detect sets
       # the root's effective reshard_after_forward=False). The override lives

@@ -130,7 +130,7 @@ class MooncakeHiddenStatesConnector(KVConnectorBase_V1):
 
     Must be used with vLLM's ``extract_hidden_states`` speculative method.
     Mooncake connection parameters are read from environment variables
-    (exported by TorchSpec's VllmEngine before creating the LLM instance).
+    (exported by the engine wrapper before creating the LLM instance).
     """
 
     @property

@@ -81,15 +81,13 @@ def compiled_forward_kl_loss_from_hs(
     is computed from ``target_hidden_states_flat @ target_lm_head_weight`` per
     call rather than read from a pre-built ``(B*T, V)`` tensor. Saves the
     resident ``target_p_padded`` tensor at the cost of a per-TTT-step full-vocab
-    projection. Useful when ``V_full`` is large and the loss-mask is sparse —
-    see ``LazyTarget vs Precomputed Memory Analysis.md`` for the crossover.
+    projection. Useful when ``V_full`` is large and the loss-mask is sparse.
 
     Defensive ``.detach()`` calls on the target inputs are belt-and-suspenders:
     the factory (``compute_lazy_target_padded``) already strips grad lineage,
     but a future caller could regress that. Detaching here guarantees the
     target side never participates in autograd, which is the prerequisite for
-    micro-batch FSDP gradient accumulation (see hazards #1 and #3 in
-    ``Loss Kernel Choice — Lazy vs Precomputed.md``).
+    safe micro-batch FSDP gradient accumulation.
 
     Args:
         prenorm_hidden_states_flat: (B*T, H) — flattened draft hidden states

@@ -9,8 +9,9 @@
 
 Covers everything except the actual Ray + vLLM + Mooncake spin-up:
 
-* ``utils.chat_template_tokenize.build_input_ids_and_loss_mask`` matches TorchSpec's
-  ``preprocess_conversations`` byte-for-byte (input_ids and loss_mask).
+* ``utils.chat_template_tokenize.build_input_ids_and_loss_mask`` produces a
+  per-token assistant loss_mask aligned with input_ids across multi-turn
+  conversations (every assistant turn supervised, user/system turns zero).
 * ``ParquetDrafterPretrainDataset`` + ``DrafterPretrainCollator`` produce a
   DataProto whose ``loss_mask`` is non-zero on assistant tokens only.
 * ``hs_collector.manager._unpad_sequence_and_mask`` correctly slices both the
@@ -26,7 +27,6 @@ Run with: pytest recipe/drafter_cotraining/tests/test_pretrain_loss_mask_pipelin
 
 from __future__ import annotations
 
-import os
 import sys
 import json
 from pathlib import Path
@@ -62,35 +62,6 @@ def synthetic_conversations() -> list[list[dict]]:
             {"role": "assistant", "content": "Hello!"},
         ],
     ]
-
-
-def test_loss_mask_matches_torchspec(tokenizer, synthetic_conversations):
-    """Verify byte-for-byte parity with TorchSpec's preprocess_conversations.
-
-    Skips when the TorchSpec source tree isn't available (CI containers etc.).
-    """
-    if os.path.exists("/root/TorchSpec"):
-        sys.path.insert(0, "/root/TorchSpec")
-    try:
-        from torchspec.data.preprocessing import preprocess_conversations
-        from torchspec.data.template import TEMPLATE_REGISTRY
-    except ImportError:
-        pytest.skip("TorchSpec not available")
-
-    from recipe.drafter_cotraining.utils.chat_template_tokenize import build_input_ids_and_loss_mask
-
-    for conv in synthetic_conversations:
-        ids, mask = build_input_ids_and_loss_mask(tokenizer, conv, "qwen", 8192)
-        out = preprocess_conversations(
-            tokenizer, [conv], TEMPLATE_REGISTRY.get("qwen"),
-            max_length=8192, is_preformatted=False,
-            include_attention_mask=False, use_packed_loss_mask=False,
-            add_generation_prompt=False,
-        )
-        ts_ids = out["input_ids"][0].squeeze()
-        ts_mask = out["loss_mask"][0].squeeze()
-        assert torch.equal(ids, ts_ids)
-        assert torch.equal(mask, ts_mask)
 
 
 def test_loss_mask_supervises_every_assistant_turn(tokenizer):

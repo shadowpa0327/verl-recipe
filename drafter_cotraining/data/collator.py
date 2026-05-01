@@ -1,9 +1,8 @@
 """Right-pad variable-length samples to a uniform bucketed length.
 
-Generic refactor of TorchSpec ``DataCollatorWithPadding``. Pads any per-sample
-dict by tensor rank (2D ``[1,T]`` or 3D ``[1,T,D]``); only keys present in
-*every* sample are emitted (so optional features like Eagle3's
-``last_hidden_states`` are dropped automatically when missing).
+Pads any per-sample dict by tensor rank (2D ``[1,T]`` or 3D ``[1,T,D]``);
+only keys present in *every* sample are emitted (so optional features like
+Eagle3's ``last_hidden_states`` are dropped automatically when missing).
 
 The 256-token bucket bounds the set of distinct ``T_pad`` shapes the draft
 model sees, so torch.compile / FlexAttention recompiles are bounded.

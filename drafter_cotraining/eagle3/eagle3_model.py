@@ -33,7 +33,6 @@ from recipe.drafter_cotraining.eagle3.ops.loss import (
 def padding(tensor, left=True):
     """Shift tensor by one position along dim=1 with zero padding.
 
-    Mirrors TorchSpec's torchspec.utils.tensor.padding:
     - left=True:  shift right (prepend zero, drop last)
     - left=False: shift left  (drop first, append zero)
     """
@@ -72,8 +71,7 @@ class LazyTarget:
     Holds the verifier hidden-states and lm_head weight only; the softmax
     over V_full is computed inside ``compiled_forward_kl_loss_from_hs`` per
     TTT step rather than materialized as a (B, T+length, V_full) resident
-    tensor. Trades resident memory for per-step compute — see
-    ``LazyTarget vs Precomputed Memory Analysis.md`` for the crossover.
+    tensor. Trades resident memory for per-step compute.
 
     Both fields are detached at factory time (``compute_lazy_target_padded``)
     and again inside the compiled kernel as a belt-and-suspenders defense
@@ -352,8 +350,7 @@ def compute_lazy_target_padded(
     The compiled kernel ``compiled_forward_kl_loss_from_hs`` repeats the
     detach on its target inputs as belt-and-suspenders. Three layers
     matter because lazy is only safe under FSDP micro-batching when the
-    target side is fully outside the autograd graph (see hazards #1 and
-    #3 in ``Loss Kernel Choice — Lazy vs Precomputed.md``).
+    target side is fully outside the autograd graph.
     """
     return LazyTarget(
         hidden_states_padded=F.pad(

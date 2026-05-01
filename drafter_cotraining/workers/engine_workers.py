@@ -11,8 +11,6 @@ This worker:
 - Receives per-rank data via mesh dispatch (update_drafter)
 - Fetches tensors from Mooncake
 - Runs drafter training
-
-See claude_docs/rfc-drafter-trainer-integration.md for the full design.
 """
 
 import logging
@@ -159,9 +157,8 @@ class ActorRolloutRefDrafterWorker(ActorRolloutRefWorker):
         target_lm_head_weight for target distribution, verifier_norm for
         pre-norm correction. The drafter's own lm_head is trainable and NOT synced.
 
-        Called at init and after each update_actor(). In verl the actor trains
-        every RL step (unlike TorchSpec where the target is fixed), so the
-        drafter's frozen copies must stay synchronized.
+        Called at init and after each update_actor(). The actor trains every
+        RL step, so the drafter's frozen copies must stay synchronized.
 
         TODO(co-training): Implement FSDP-aware gathering of actor params.
         Currently only works when actor/drafter are on the same FSDP unit.
@@ -226,7 +223,7 @@ class ActorRolloutRefDrafterWorker(ActorRolloutRefWorker):
             self._log_drafter_batch_shapes(batch, rank)
             return DataProto(non_tensor_batch=data.non_tensor_batch)
 
-        # ── Step 1: metadata-only empty-mask filter (TorchSpec data_fetcher.py:177)
+        # ── Step 1: metadata-only empty-mask filter (no tensor fetch)
         loss_masks = data.non_tensor_batch.get("loss_masks", None)
         valid_counts = self._compute_valid_counts(data)
         if loss_masks is not None and len(loss_masks) > 0:
@@ -278,8 +275,7 @@ class ActorRolloutRefDrafterWorker(ActorRolloutRefWorker):
         t_pad_macro = self._allreduce_max_int(local_t_pad)
 
         # ── Step 4-5: micro-batch loop + optimizer step
-        # self.config is already the actor_rollout_ref slice (see trainer/ray_trainer.py:717
-        # and trainer/pretrain_trainer.py:288).
+        # self.config is already the actor_rollout_ref slice.
         micro_size = int(
             self.config.drafter.engine_config.get("micro_batch_size_per_gpu", 1)
         )
@@ -348,7 +344,7 @@ class ActorRolloutRefDrafterWorker(ActorRolloutRefWorker):
         sample, matching the prefilled token sequence) and aligns it to the
         Mooncake-returned ``input_ids`` length. This replaces the older
         prompt+response-derived mask path; we now supervise every assistant
-        content token across all turns (TorchSpec semantics).
+        content token across all turns.
 
         t_pad_override: when provided, collator pads to at least this length
             (still snapped to a 256-token bucket). Lets the macro-step
@@ -422,9 +418,8 @@ class ActorRolloutRefDrafterWorker(ActorRolloutRefWorker):
                 lhs = out.last_hidden_states
                 feat["last_hidden_states"] = lhs.unsqueeze(0) if lhs.dim() == 2 else lhs
             features.append(feat)
-            # Force-delete Mooncake keys right after fetch (matches TorchSpec
-            # data_fetcher._cleanup_mooncake_data — frees the buffer for the
-            # next prefill while the GPU consumes this sample).
+            # Force-delete Mooncake keys right after fetch — frees the buffer
+            # for the next prefill while the GPU consumes this sample.
             store.remove_eagle3_tensors(
                 key=key,
                 has_last_hidden_states=out.last_hidden_states is not None,
@@ -545,8 +540,8 @@ class ActorRolloutRefDrafterWorker(ActorRolloutRefWorker):
         N backwards reproduces single-batch mean semantics exactly.
 
         FSDP2-only: set_requires_gradient_sync(is_last) suppresses inter-rank
-        reduce-scatter on all-but-last micro-batch (mirrors TorchSpec). On FSDP1
-        the attribute is missing → no-op via getattr guard.
+        reduce-scatter on all-but-last micro-batch. On FSDP1 the attribute is
+        missing → no-op via getattr guard.
         """
         engine = self.drafter.engine
         device = torch.device("cuda", torch.cuda.current_device())
@@ -832,8 +827,7 @@ class ActorRolloutRefDrafterWorker(ActorRolloutRefWorker):
         raise NotImplementedError(
             "update_rollout_drafter_weights_from_snapshot requires "
             "rollout.get_drafter_weights / rollout.update_drafter_weights "
-            "APIs (reverted for pretrain-only scope). "
-            "See TODO(co-training) in weight-sync-flows.md Flow 4."
+            "APIs (reverted for pretrain-only scope)."
         )
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
@@ -860,13 +854,12 @@ class ActorRolloutRefDrafterWorker(ActorRolloutRefWorker):
             self._sync_drafter_frozen_modules()
 
         if self.drafter is not None and self.rollout is not None:
-            # TODO(co-training): Drafter → rollout weight sync (Flow 4).
+            # TODO(co-training): Drafter → rollout weight sync.
             # Requires update_drafter_weights API in vllm_rollout (reverted
             # for pretrain-only scope). Re-enable when co-training is activated.
             raise NotImplementedError(
                 "Drafter → rollout weight sync is not yet implemented. "
-                "Required for co-training only (speculative decoding at inference time). "
-                "See TODO(co-training) in weight-sync-flows.md Flow 4."
+                "Required for co-training only (speculative decoding at inference time)."
             )
 
 

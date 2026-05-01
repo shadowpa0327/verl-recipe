@@ -17,8 +17,6 @@ PPO Trainer with EAGLE drafter co-training sub-pipeline.
 Subclasses RayPPOTrainer to insert drafter HS collection + training
 after generate_sequences() and before reward computation. Follows the
 same override pattern as recipe/dapo/dapo_ray_trainer.py.
-
-See claude_docs/rfc-drafter-trainer-integration.md for design.
 """
 
 import json

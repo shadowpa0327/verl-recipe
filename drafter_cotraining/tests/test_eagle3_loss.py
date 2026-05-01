@@ -1,6 +1,4 @@
-"""Tests for Eagle3 loss computation paths (verl port).
-
-Mirrors reference/TorchSpec/tests/test_eagle3_loss.py but imports from recipe.drafter_cotraining.eagle3.
+"""Tests for Eagle3 loss computation paths.
 
 Verifies that:
 1. compiled_forward_kl_loss matches a naive reference implementation.

@@ -1424,7 +1424,7 @@ class LlamaFlexAttention(LlamaAttention):
         seq_lengths -= lck
         # create_block_mask always goes through the compiled wrapper now: the
         # dense (B, H, Q_LEN, KV_LEN) intermediate it avoids dominates memory at
-        # every q_len. See claude_docs/eagle3-block-mask-memory-diagnosis.md.
+        # every q_len.
         create_block_mask_func = compile_friendly_create_block_mask
         # TODO: Remove the usage of uncompiled flex_attention after
         # https://github.com/pytorch/pytorch/issues/160018

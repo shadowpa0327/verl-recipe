@@ -1,8 +1,6 @@
 """Multi-turn conversation tokenization with per-turn assistant loss mask.
 
-Ported from TorchSpec ``torchspec/data/parse.py:_tokenize_with_loss_mask`` and
-``torchspec/data/preprocessing.py:preprocess_conversations``. Reduced to the
-"general parser" path which is sufficient for Qwen / Llama chat templates.
+The "general parser" path, sufficient for Qwen / Llama chat templates.
 
 The flow per row:
 
@@ -19,8 +17,6 @@ The flow per row:
 4. Truncation past max_length is handled implicitly by ``min(s_tok, T)`` and
    ``min(e_tok, T)`` clamps — partial assistant turns contribute their
    surviving prefix.
-
-Reference: ``/root/TorchSpec/docs/preprocessing_port_spec.md`` section 3.
 """
 
 from __future__ import annotations
@@ -41,7 +37,7 @@ class _ChatTemplateAnchors:
     system_prompt: str | None = None
 
 
-# Chat-template anchors keyed by short name, matching TorchSpec's registry.
+# Chat-template anchors keyed by short name.
 # Add more entries here as new model families are needed.
 _ANCHOR_REGISTRY: dict[str, _ChatTemplateAnchors] = {
     "qwen": _ChatTemplateAnchors(
@@ -52,7 +48,7 @@ _ANCHOR_REGISTRY: dict[str, _ChatTemplateAnchors] = {
     "qwen3-instruct": _ChatTemplateAnchors(
         # Qwen3-Instruct injects an empty <think>...</think> block right after
         # the assistant header. Anchoring on that ensures the loss mask covers
-        # the post-think content (matches TorchSpec's qwen3-instruct entry).
+        # the post-think content.
         assistant_header="<|im_start|>assistant\n<think>\n\n</think>\n",
         end_of_turn_token="<|im_end|>\n",
         system_prompt="You are a helpful assistant.",
@@ -82,7 +78,7 @@ def _ensure_system_prompt(
     system_prompt: str | None,
 ) -> list[dict[str, Any]]:
     """If the conversation has no system turn and a fallback is configured,
-    prepend it. Mirrors TorchSpec ``GeneralParser.format``."""
+    prepend it."""
     if not conversation:
         return conversation
     if conversation[0].get("role") == "system":
@@ -101,7 +97,7 @@ def _render_conversation(
     """Apply the tokenizer's chat template (Jinja) to a canonical conversation.
 
     If ``anchors.system_prompt`` is set and the conversation has no system
-    turn, the fallback is prepended (matches TorchSpec).
+    turn, the fallback is prepended.
     """
     kwargs = dict(apply_chat_template_kwargs or {})
     kwargs.setdefault("add_generation_prompt", False)

@@ -195,7 +195,7 @@ actor_rollout_ref:
     # FSDP engine config — keys here match FSDPEngineConfig fields. Defaults are
     # sensible for a tiny draft model on 2+ GPUs. Override from CLI if needed.
     engine_config:
-      # FSDP2 with selective wrap (TorchSpec-style): only LlamaDecoderLayer
+      # FSDP2 with selective wrap: only LlamaDecoderLayer
       # gets its own FSDP unit; lm_head/norm/fc/embed_tokens stay in the root
       # unit so they remain gathered through backward (auto-root-detect sets
       # the root's effective reshard_after_forward=False). The override lives
@@ -219,9 +219,9 @@ actor_rollout_ref:
 
     # FSDP optimizer config — keys match FSDPOptimizerConfig. total_training_steps
     # must be set at runtime (e.g. to micro.max_steps in the training smoke) or
-    # the cosine LR scheduler plateaus immediately. Defaults track TorchSpec's
-    # eagle3 training knobs (lr=1e-4, weight_decay=0, warmup_ratio=0.015,
-    # max_grad_norm=0.5, cosine decay) so smoke runs match its training signal.
+    # the cosine LR scheduler plateaus immediately. Defaults track the
+    # standard EAGLE3 training knobs (lr=1e-4, weight_decay=0, warmup_ratio=0.015,
+    # max_grad_norm=0.5, cosine decay).
     optimizer_config:
       lr: 1.0e-4
       weight_decay: 0.0

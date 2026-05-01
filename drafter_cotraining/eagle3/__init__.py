@@ -1,1 +1,1 @@
-"""Eagle3 drafter model for speculative decoding co-training."""
+"""Eagle3 drafter model for speculative decoding."""

@@ -123,8 +123,7 @@ def _unpad_sequence_and_mask(data: DataProto) -> tuple[list[int], np.ndarray]:
     if "loss_masks" not in nt:
         raise KeyError(
             "DataProto.non_tensor_batch is missing required key 'loss_masks'. "
-            "The drafter pipeline requires a per-sample assistant loss_mask "
-            "produced upstream (see DrafterPretrainCollator)."
+            "The drafter pipeline requires a per-sample assistant loss_mask."
         )
     raw = nt["loss_masks"][0]
     if isinstance(raw, np.ndarray):

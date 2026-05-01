@@ -174,9 +174,8 @@ class DrafterPretrainCollator:
 
     The collator owns the tokenizer because the per-row work depends on the
     chat template registered by the user. It drops rows that produce a
-    zero-supervision mask (matches TorchSpec's ``min_loss_tokens`` filter at
-    a min of 1) so the macro-step doesn't waste a slot on a row the drafter
-    can't learn from.
+    zero-supervision mask so the macro-step doesn't waste a slot on a row
+    the drafter can't learn from.
     """
 
     def __init__(
